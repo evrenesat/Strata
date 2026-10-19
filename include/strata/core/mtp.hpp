@@ -21,6 +21,7 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/mtp_request.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -66,6 +67,14 @@ public:
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
+    // Serial, fully drained request transfer; no graph/stream handles are copied.
+    std::array<int64_t,13> request_geometry() const;
+    bool request_bytes(int64_t extent, size_t& bytes, std::string& error) const;
+    bool request_capture(MtpRequestState&, int64_t extent, std::string& error);
+    bool request_validate(const MtpRequestState&, int64_t prompt, int64_t extent, std::string& error) const;
+    bool request_restore(const MtpRequestState&, SessionState&, std::string& error);
+    bool request_verify(const MtpRequestState&,uint64_t& fingerprint,std::string& error,
+                        bool restored_residency = true) const;
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);

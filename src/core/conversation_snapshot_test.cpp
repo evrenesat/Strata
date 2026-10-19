@@ -193,6 +193,16 @@ void full_session(int fmt, int mode, int experts) {
           restored.live.dead==a.live.dead && restored.live.block_pos==a.live.block_pos &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
+    {
+        SavedConversation main_only;
+        check(conversation_snapshot_save(main_only,view,ss,g,nullptr,err),"capture proof fixture without draft");
+        uint64_t fingerprint=0;
+        check(conversation_snapshot_verify(main_only,ss,g,fingerprint,err),"bounded whole main readback including running state");
+        cuda_check(cudaMemset(ss.gdn_state,31,main_only.live.gdn.size()));
+        check(!conversation_snapshot_verify(main_only,ss,g,fingerprint,err),"readback detects changed recurrent state");
+        check(conversation_snapshot_restore(main_only,ss,g,nullptr,err)==ConversationRestore::restored,"repair exact proof fixture");
+        check(conversation_snapshot_verify(main_only,ss,g,fingerprint,err),"readback after repaired restore");
+    }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty};

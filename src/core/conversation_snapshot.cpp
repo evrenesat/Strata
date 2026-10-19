@@ -254,7 +254,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
+                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error,bool restored_residency) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
@@ -277,7 +277,7 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
             })) return false;
-    if (st.kv_mode == 2 && image.cells > 0) {
+    if (restored_residency && st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
         const int64_t end = image.cells / image.page_size;
         const int64_t begin = std::max<int64_t>(0, end - st.n_slots);
