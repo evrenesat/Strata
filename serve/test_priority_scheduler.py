@@ -265,12 +265,21 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsInstance(b.failure, PriorityResumeRefusedPersistent)
         self.assertIn('priority_resume_refused_persistent', str(b.failure))
         self.assertIsNone(self.s.parked)
-        self.assertNotIn('PCANCEL 1', self.sent)          # the capsule was neither cancelled nor stopped
+        self.assertEqual(self.sent[-1], 'PCANCEL 1')      # the stranded capsule is retired, not orphaned
         self.assertNotIn('PSTOP', ' '.join(self.sent))
         evidence = [e for e in self.s.protocol_evidence if e[1] == 'resume_refused_persistent']
         self.assertEqual(evidence[-1][2:], (b.id, 'resume_unavailable'))
+        self.s.feed('R 1 DONE 3 3 0 0 cancel 0 0 0')      # the retirement's terminal is consumed quietly
+        self.assertEqual(b.state, 'failed')
         b2 = self.bg()                           # a dropped parked slot never blocks background work
         self.assertEqual(self.s.active, b2.id)
+        # VIP 2 must still preempt: the retired capsule no longer occupies the engine's
+        # single park slot (no nested_pause).
+        h2 = self.s.submit('GEN 10 7,8', Role.HERMES)
+        self.assertEqual(self.sent[-1], 'PPAUSE %d' % b2.id)
+        self.s.feed('PAUSED %d decode 3 1' % b2.id)
+        self.s.feed('R %d DONE 2 2 1 1 stop 0 0 0' % h2.id)
+        self.assertEqual([r.state for r in (b2, h2)], ['parked', 'done'])
     def test_resume_refusal_deadline_is_configurable_and_bounded(self):
         for bad in (0, 4, -1, 86401):
             with self.assertRaises(ValueError):
@@ -284,7 +293,30 @@ class SchedulerTests(unittest.TestCase):
         s.feed('PREFUSED 1 resume_unavailable')  # first refusal at t=301: the next retry strands
         clock.advance(5); s.tick()
         self.assertEqual(b.state, 'failed')
-        self.assertNotIn('PCANCEL 1', sent)
+        self.assertEqual(sent[-1], 'PCANCEL 1')   # the capsule is retired with the request
+    def test_queue_full_counts_only_queued_and_drives_preheader_refusal(self):
+        from serve.priority_scheduler import PriorityQueueFull
+        s = PriorityScheduler(lambda _: None, clock=Clock(), timer=False, max_queued_requests=1)
+        self.assertFalse(s.queue_full())
+        a = s.submit('GEN 100 1,2,3')                        # admitted at once: running, not queued
+        self.assertFalse(s.queue_full())
+        b = s.submit('GEN 100 4,5,6')                        # one queued: the count bound is hit
+        self.assertTrue(s.queue_full())
+        s.feed('R %d DONE 3 3 0 0 stop 0 0 0' % a.id)        # b leaves the queue when admitted
+        self.assertFalse(s.queue_full())
+        running = self.s.submit('GEN 100 1,2,3'); self.s.tick()
+        parked = self.park()                                  # running and parked never count
+        self.assertFalse(self.s.queue_full())
+    def test_priority_settings_readers_and_deadline_config(self):
+        from serve import server
+        self.assertEqual(server.priority_resume_retry_deadline({}), 300)
+        self.assertEqual(server.priority_resume_retry_deadline(
+            {'priority': {'resume_retry_deadline_seconds': 60}}), 60)
+        for bad in (0, 4, 86401, True, 'x'):
+            with self.assertRaises(ValueError):
+                server.priority_resume_retry_deadline(
+                    {'priority': {'resume_retry_deadline_seconds': bad}})
+
     def test_backfill_refusals_do_not_arm_the_resume_deadline(self):
         b = self.park(); self.s.admit_backfill(BackfillAdmission('a'*64, True, 1, (1, 1, 1)), 'a'*64)
         self.clock.advance(10); self.s.tick()

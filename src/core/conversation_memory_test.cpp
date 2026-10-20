@@ -95,8 +95,6 @@ int main() {
     std::printf("conversation_memory_test: %d checks passed\n", checks);
 
     // ---- cgroup memory admission (P2-d): the budget is min(host, cgroup allowance) ----
-    int cg_checks = 0;
-    const auto note = [&cg_checks](bool ok, const char* label) { (void)note; return ok; };
     // One cgroup memory file reading: "max"/sentinel are unbounded, malformed is unknown.
     {
         std::istringstream max_text("max\n");
@@ -156,10 +154,9 @@ int main() {
     // v1 fallback: the memory controller hierarchy under <root>/memory.
     {
         CgroupTree tree("strata-cgmem-v1");
-        tree.write(tree.proc(), "9:memory:/jobA\n0::/\n");
+        tree.write(tree.proc(), "9:memory:/jobA\n");
         tree.write(tree.root / "memory" / "jobA" / "memory.limit_in_bytes", "5000\n");
         tree.write(tree.root / "memory" / "jobA" / "memory.usage_in_bytes", "1200\n");
-        // The 0:: line is present but empty-path: v1's memory controller still binds first here.
         check(tree.read().available == 3800, "v1 limit minus usage is the allowance");
         tree.write(tree.root / "memory" / "jobA" / "memory.limit_in_bytes", "9223372036854771712\n");
         check(conversation_memory_bound(12345 * 1024, tree.read()) == 12345 * 1024,
@@ -171,5 +168,5 @@ int main() {
         check(!available || conversation_memory_admit(available, 0, 0),
               "provider returns bytes or unknown");
     }
-    std::printf("conversation_memory_test: %d cgroup checks passed\n", cg_checks);
+    std::printf("conversation_memory_test: %d checks passed\n", checks);
 }

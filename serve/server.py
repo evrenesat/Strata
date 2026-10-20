@@ -622,13 +622,18 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False):
+                 env: dict | None = None, lazy: bool = False,
+                 priority_queue_limits: tuple[int, int] | None = None,
+                 priority_resume_retry_deadline_seconds: int | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.priority_configured = '--priority-serving' in args
         self.priority = None
         # Bounded queue admission for priority mode (the config's priority section may set
         # both; see priority_queue_limits): queued requests at most, and their command bytes.
-        self.priority_queue_limits = (64, 8 * 1024 * 1024)
+        # Passed in at construction so a non-lazy startup's scheduler sees the configured
+        # values immediately; restart() keeps them because they live on self.
+        self.priority_queue_limits = priority_queue_limits or (64, 8 * 1024 * 1024)
+        self.priority_resume_retry_deadline_seconds = priority_resume_retry_deadline_seconds
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -767,8 +772,10 @@ class StrataEngine:
                 raise ValueError('priority mode requires the matching serial native protocol')
             owned_proc=self.proc
             limits = self.priority_queue_limits
+            deadline = self.priority_resume_retry_deadline_seconds
             self.priority = PriorityScheduler(self._send, silence_seconds=float(self.silence_s or 120),
                 max_queued_requests=limits[0], max_queued_command_bytes=limits[1],
+                resume_retry_deadline_seconds=deadline if deadline is not None else 300,
                 fatal=lambda error:self._priority_fatal(error,owned_proc))
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -1520,6 +1527,11 @@ class StrataEngine:
             self.release_priority(r)
             raise
 
+    def priority_queue_full(self):
+        """Pre-header count check for streaming requests in priority mode (finding 5)."""
+        scheduler = self.priority
+        return bool(scheduler) and scheduler.queue_full()
+
     def release_priority(self, r):
         scheduler=r.origin
         if not isinstance(scheduler,PriorityScheduler):
@@ -2192,6 +2204,20 @@ PRIORITY_MAX_QUEUED_REQUESTS = 64                    # priority."max_queued_requ
 PRIORITY_MAX_QUEUED_COMMAND_BYTES = 8 * 1024 * 1024  # priority."max_queued_command_bytes"
 
 
+def priority_resume_retry_deadline(cfg: dict) -> int:
+    """The priority section's optional resume_retry_deadline_seconds: how long a parked
+    request's refused resumes keep retrying (5 s interval) before the request fails with
+    priority_resume_refused_persistent and its capsule is retired.  5..86400 s."""
+    priority = cfg.get('priority')
+    if priority is None:
+        return 300
+    seconds = priority.get('resume_retry_deadline_seconds', 300)
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or not 5 <= seconds <= 86400:
+        raise ValueError('"priority"."resume_retry_deadline_seconds" must be a whole number '
+                         f'5..86400, not {seconds!r}')
+    return seconds
+
+
 def priority_queue_limits(cfg: dict) -> tuple[int, int]:
     """The priority section's optional queue bounds: how many requests may sit queued and how many
     command bytes they may hold in total before a new submission is refused with 503
@@ -2271,6 +2297,7 @@ def engine_args(cfg: dict) -> list[str]:
     if priority.get('idle_backfill'):
         raise ValueError('idle backfill requires trusted profile-bound measured admission')
     priority_queue_limits(cfg)   # the optional queue bounds are validated before launch, too
+    priority_resume_retry_deadline(cfg)   # and the resume retry deadline with them
     if priority.get('enabled') or '--priority-serving' in args:
         if any(k in args for k in ('--batch', '--slots', '--layer-split', '--pipeline-windows', '--lookup-chain')):
             raise ValueError('priority requires a serial single-GPU engine')
@@ -5047,6 +5074,11 @@ def make_handler(svc: Service):
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
+            if getattr(svc.engine, 'priority_queue_full', lambda: False)():
+                # Pre-header admission (count bound): a queued-slot shortage is refused as a
+                # real HTTP 503 with a machine-readable code, not as an in-stream event the
+                # client may treat as the model's answer (the byte bound stays at submit).
+                raise PriorityQueueFull('priority_queue_full; retry after 5 seconds')
             self._sse()
             try:
                 for c in chunks:
@@ -5061,7 +5093,11 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
             except (EngineDied,PriorityUnavailable) as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                if isinstance(e, PriorityQueueFull):   # the byte bound at submit time: a machine-readable code
+                    err = {"error": {"type": "priority_queue_full", "code": "priority_queue_full",
+                                     "message": str(e)}}
+                else:
+                    err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -5135,6 +5171,11 @@ def make_handler(svc: Service):
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
+            if getattr(svc.engine, 'priority_queue_full', lambda: False)():
+                # Pre-header admission (count bound): a queued-slot shortage is refused as a
+                # real HTTP 503 with a machine-readable code, not as an in-stream event the
+                # client may treat as the model's answer (the byte bound stays at submit).
+                raise PriorityQueueFull('priority_queue_full; retry after 5 seconds')
             self._sse()
             last = time.monotonic()
 
@@ -5257,6 +5298,11 @@ def make_handler(svc: Service):
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
+            if getattr(svc.engine, 'priority_queue_full', lambda: False)():
+                # Pre-header admission (count bound): a queued-slot shortage is refused as a
+                # real HTTP 503 with a machine-readable code, not as an in-stream event the
+                # client may treat as the model's answer (the byte bound stays at submit).
+                raise PriorityQueueFull('priority_queue_full; retry after 5 seconds')
             self._sse()
             try:
                 for item in events:
@@ -5762,13 +5808,16 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
-        engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         try:
-            engine.priority_queue_limits = priority_queue_limits(cfg)   # priority mode's bounded queue
+            # Both priority bounds are read before construction so the scheduler a non-lazy
+            # startup creates immediately sees the configured values.
+            queue_limits, resume_deadline = priority_queue_limits(cfg), priority_resume_retry_deadline(cfg)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
+        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                              env=env, lazy=lazy, priority_queue_limits=queue_limits,
+                              priority_resume_retry_deadline_seconds=resume_deadline)
+        engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop())

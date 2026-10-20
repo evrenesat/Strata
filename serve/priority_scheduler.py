@@ -266,6 +266,14 @@ class PriorityScheduler:
         self._write(f'P{verb} {r.id} {rest}')
         r.admitted.set()
 
+    def queue_full(self):
+        """Count-based pre-header admission check: True when one more queued submission
+        would exceed max_queued_requests.  The byte bound is enforced at submit time (the
+        command's size is known only then); this lets the HTTP layer refuse with 503 before
+        streaming headers are committed."""
+        with self.lock:
+            return sum(1 for q in self.requests.values() if q.state == 'queued') >= self.max_queued_requests
+
     def cancel(self, r):
         with self.lock:
             if r.origin is not self or (self.requests.get(r.id) is not r and r.state not in ('done','failed')):
@@ -302,27 +310,38 @@ class PriorityScheduler:
         return True
 
     def _strand_parked(self, r):
-        """Persistent resume refusal: close the parked request's stream with a typed error
-        and stop retrying.  The native capsule is neither cancelled nor stopped (no PCANCEL
-        or STOP goes out): the engine keeps it parked and - verified against the engine's
-        serve loop - runs new background generations beside a parked capsule, so dropping
-        the parked slot here unblocks background work while the capsule stays recoverable
-        by a later trusted PRESUME until the engine itself ends."""
+        """Persistent resume refusal: close the parked request's stream with a typed error,
+        stop retrying, and RETIRE the native capsule with PCANCEL.  The engine supports one
+        parked capsule and refuses nested pauses, so an orphaned capsule would permanently
+        disable preemption for every later background request; and with the HTTP stream
+        already closed by the typed failure, a later resume could no longer deliver output
+        to anyone.  Retiring frees the single capsule slot, lets background work proceed
+        and keeps PPAUSE available.  The engine answers the cancellation with this
+        request's terminal line, which is consumed silently below (the client already has
+        its typed error)."""
         reason = self.resume_last_reason or 'unspecified'
         attempts = self.resume_refusals
         self.protocol_evidence.append((self.clock(), 'resume_refused_persistent', r.id, reason))
         self.resume_refusals, self.resume_first_refusal, self.resume_last_reason = 0, None, None
         self.parked = None
-        r.state, r.control = 'failed', None
+        r.state, r.control, r.stranded = 'failed', None, True
         r.failure = PriorityResumeRefusedPersistent(
             f'{PriorityResumeRefusedPersistent.code}: the engine refused resume {attempts} time(s) over '
-            f'{self.resume_retry_deadline:.0f} s (last reason {reason}); the request was not cancelled '
-            'and its parked state is kept in the engine')
+            f'{self.resume_retry_deadline:.0f} s (last reason {reason}); the request and its parked '
+            'capsule were retired (PCANCEL) so priority serving continues for new work')
         r.events.put(r.failure)
         r.admitted.set()
+        r.cancel_sent = True
+        self._write(f'PCANCEL {r.id}')
+        self.protocol_evidence.append((self.clock(), 'stranded_capsule_retired', r.id, 'pcancel'))
         self._dispatch()
 
     def _finish(self, r, line):
+        if getattr(r, 'stranded', False) and r.state == 'failed':
+            # The retired capsule's terminal (from the stranding PCANCEL): the client
+            # already received the typed persistent-refusal error, so it is only recorded.
+            self.protocol_evidence.append((self.clock(), 'stranded_capsule_terminal', r.id, line.split()[0] if line.split() else ''))
+            return
         if r.state in ('done', 'failed'):
             raise PriorityProtocolError('duplicate priority terminal event')
         r.state = 'done'
@@ -437,7 +456,8 @@ class PriorityScheduler:
                 self.fail(PriorityProtocolError('native priority state transfer failed'))
                 return
             if payload.startswith('DONE ') or payload.startswith('ERR '):
-                if not (self.active==r.id or (self.parked==r.id and r.cancel_sent)):
+                if not (self.active==r.id or (self.parked==r.id and r.cancel_sent) or
+                        getattr(r, 'stranded', False)):
                     raise PriorityProtocolError('terminal output without owned request')
                 if payload.startswith('DONE '):
                     f=payload.split()
