@@ -636,7 +636,8 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False,
                  priority_queue_limits: tuple[int, int] | None = None,
-                 priority_resume_retry_deadline_seconds: int | None = None):
+                 priority_resume_retry_deadline_seconds: int | None = None,
+                 silence_s: float | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.priority_configured = '--priority-serving' in args
         self.priority = None
@@ -787,7 +788,8 @@ class StrataEngine:
             owned_proc=self.proc
             limits = self.priority_queue_limits
             deadline = self.priority_resume_retry_deadline_seconds
-            self.priority = PriorityScheduler(self._send, silence_seconds=float(self.silence_s or 120),
+            self.priority = PriorityScheduler(self._send,
+                silence_seconds=float((silence_s if silence_s is not None else self.silence_s) or 120),
                 max_queued_requests=limits[0], max_queued_command_bytes=limits[1],
                 resume_retry_deadline_seconds=deadline if deadline is not None else 300,
                 fatal=lambda error:self._priority_fatal(error,owned_proc))
@@ -907,6 +909,7 @@ class StrataEngine:
         # The priority bounds live on self so a plain restart() keeps them; __init__ would
         # otherwise reset them to the defaults on the re-run below.
         priority_limits, priority_deadline = self.priority_queue_limits, self.priority_resume_retry_deadline_seconds
+        restart_silence = self.silence_s
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
             self.close()
@@ -917,7 +920,8 @@ class StrataEngine:
                 self.ended = True
                 try:
                     self.__init__(*self.spawn, priority_queue_limits=priority_limits,
-                                  priority_resume_retry_deadline_seconds=priority_deadline)
+                                  priority_resume_retry_deadline_seconds=priority_deadline,
+                                  silence_s=restart_silence)
                     break
                 except RuntimeError:
                     try:
@@ -4809,9 +4813,10 @@ def make_handler(svc: Service):
                 self._json(503,{"error":{"type":"priority_queue_full","code":"priority_queue_full",
                                        "message":"the priority queue is full; retry after 5 seconds"}},
                            headers={"Retry-After":"5"})
-            except PriorityUnavailable:
-                self._json(503,{"error":{"type":"priority_unavailable","code":"priority_unavailable",
-                                       "message":"foreground admission unavailable"}},headers={"Retry-After":"5"})
+            except PriorityUnavailable as e:
+                self._json(503,{"error":{"type":"priority_unavailable",
+                                       "code":getattr(e,"code","priority_unavailable"),
+                                       "message":str(e) or "foreground admission unavailable"}},headers={"Retry-After":"5"})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -5852,7 +5857,7 @@ def main() -> int:
             raise SystemExit(f"[strata] config {e}")
         engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy, priority_queue_limits=queue_limits,
-                              priority_resume_retry_deadline_seconds=resume_deadline)
+                              priority_resume_retry_deadline_seconds=resume_deadline, silence_s=silence)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

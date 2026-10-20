@@ -359,6 +359,26 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(len(self.sent), before)        # no new dispatch slipped through
             self.s.dead = None                              # each case examined in isolation
 
+    def test_late_ppause_and_pcancel_after_done_are_benign(self):
+        b = self.bg(); self.s.tick()
+        h = self.fg()                                     # PPAUSE 1 is in flight when...
+        self.s.feed('R 1 DONE 3 3 0 0 stop 0 0 0')        # ...the background finishes first
+        self.assertEqual(b.state, 'done')
+        self.s.feed('PREFUSED 1 inactive_request')        # the engine erased the request
+        self.assertIsNone(self.s.dead)                    # benign: the engine stays up
+        self.assertIsNone(self.s.parked)
+        self.s.tick()
+        self.assertEqual(h.state, 'running')              # the queued VIP proceeds normally
+    def test_late_pcancel_for_a_released_id_is_benign(self):
+        b = self.bg(); self.s.tick()
+        self.s.cancel(b)                                  # PCANCEL 1 is written...
+        self.s.feed('R 1 DONE 0 3 0 0 cancel 0 0 0')      # ...the DONE lands first
+        self.s.release(b)                                 # ...and the HTTP side releases
+        self.s.feed('PREFUSED 1 inactive_request')        # the late reply to that PCANCEL
+        self.assertIsNone(self.s.dead)
+        c = self.bg(); self.s.tick()
+        self.assertEqual(c.state, 'running')              # scheduling continues
+
     def test_backfill_refusals_do_not_arm_the_resume_deadline(self):
         b = self.park(); self.s.admit_backfill(BackfillAdmission('a'*64, True, 1, (1, 1, 1)), 'a'*64)
         self.clock.advance(10); self.s.tick()

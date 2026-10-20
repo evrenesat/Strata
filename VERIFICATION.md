@@ -9,7 +9,7 @@ repository plus one GPU host.
 
 - CPU ownership/validation tests (no GPU needed):
   `cmake -S . -B build-cpu -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_CONVERSATION_TESTS=ON`, then
-  `ctest --test-dir build-cpu --output-on-failure -R 'generation_capsule_test|conversation_memory_test|conversation_validation_test'`.
+  `ctest --test-dir build-cpu --output-on-failure -R 'generation_capsule_test|conversation_memory_test'`.
 - HIP engine (tested on gfx1100 / RX 7900 XTX, ROCm 7.14): configure with
   `STRATA_ENABLE_HIP=ON`, `CMAKE_HIP_ARCHITECTURES=gfx1100`,
   `STRATA_BUILD_CONVERSATION_TESTS=ON`; build the `strata` target and the

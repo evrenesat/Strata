@@ -42,10 +42,12 @@ while True:
         payload=list(b'HERMES')+[257] if priority and rid%2==0 else reply
         active=dict(id=rid,at=0,tokens=payload,prompt=len(fields[-1].split(',')),limit=int(fields[2 if priority else 1]))
     elif line.startswith('PPAUSE '):
-        assert active and active['id']==int(line.split()[1]) and parked is None
-        print(f"R {active['id']} BLOCK state_transfer 180",flush=True)
-        parked,active=active,None
-        print(f"PAUSED {parked['id']} decode {parked['prompt']-1+parked['at']} {parked['at']}",flush=True)
+        if not active or active['id']!=int(line.split()[1]):
+            print(f"PREFUSED {line.split()[1]} inactive_request",flush=True)
+        else:
+            print(f"R {active['id']} BLOCK state_transfer 180",flush=True)
+            parked,active=active,None
+            print(f"PAUSED {parked['id']} decode {parked['prompt']-1+parked['at']} {parked['at']}",flush=True)
     elif line.startswith('PRESUME '):
         assert not active and parked and parked['id']==int(line.split()[1])
         print(f"R {parked['id']} BLOCK state_transfer 180",flush=True)
@@ -55,7 +57,7 @@ while True:
         rid=int(line.split()[1])
         if active and active['id']==rid:terminal(active,'cancel');active=None
         elif parked and parked['id']==rid:terminal(parked,'cancel');parked=None
-        else:raise RuntimeError('cancel without owner')
+        else:print(f"PREFUSED {rid} inactive_request",flush=True)
     elif line=='STOP':
         if active:terminal(active,'cancel');active=None
     if active:

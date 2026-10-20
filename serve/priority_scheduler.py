@@ -385,6 +385,15 @@ class PriorityScheduler:
             raise PriorityProtocolError('untagged engine output in priority mode')
         if not parts[1].isdecimal() or not 0 < int(parts[1]) < 2**63:
             raise PriorityProtocolError('bad request ID')
+        # The engine erases a finished request's pending controls and answers a late
+        # PPAUSE/PCANCEL with `PREFUSED <id> inactive_request`; that can land after the
+        # DONE (or after the HTTP side released the id).  It is benign - never poison.
+        if (parts[0] == 'PREFUSED' and len(parts) > 2 and parts[2].split()[:1] == ['inactive_request']
+                and int(parts[1]) not in self.retiring):
+            self.protocol_evidence.append((self.clock(), 'late_control_refused', int(parts[1]),
+                                           'inactive_request'))
+            self._dispatch()
+            return
         if int(parts[1]) in self.retiring:
             retired, _deadline = self.retiring[int(parts[1])]
             payload = parts[2] if len(parts) > 2 else ''
@@ -437,6 +446,14 @@ class PriorityScheduler:
                 self._write(f'PPAUSE {r.id}')
         elif parts[0] == 'PREFUSED':
             reason = self._reason_token(parts[2] if len(parts) > 2 else '')
+            if (r.state in ('done', 'failed') and
+                    parts[2].split()[:1] == ['inactive_request']):
+                # The request finished naturally while its control was in flight; the
+                # engine erased it and answered the late PPAUSE/PCANCEL.  Nothing to do.
+                self.protocol_evidence.append((self.clock(), 'late_control_refused', r.id,
+                                               'inactive_request'))
+                self._dispatch()
+                return
             if self.active == r.id and r.control=='resume' and r.state in ('resuming','cancelling'):
                 was_backfill = r.backfill
                 self.active, r.state = None, 'cancelling' if r.cancel_sent else 'parked'
@@ -558,7 +575,21 @@ class PriorityScheduler:
             self.tick()
 
     def close(self):
-        self.fail(PriorityProtocolError('priority engine closed'))
+        """Deliberate shutdown (engine.close): mark the scheduler dead and wake every
+        waiter WITHOUT the fatal hook, so the engine's own QUIT path - which frees and
+        unpins memory and saves the exit profile - still runs."""
+        with self.lock:
+            if self.dead:
+                return
+            self.dead = PriorityProtocolError('priority scheduler closed')
+            for r in self.requests.values():
+                if r.state not in ('done', 'failed'):
+                    r.state = 'failed'
+                    r.failure = self.dead
+                    r.events.put(self.dead)
+                    r.admitted.set()
+            self.active = self.parked = None
+            self.closed.set()
 
     def release(self, r):
         with self.lock:
