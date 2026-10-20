@@ -29,7 +29,8 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error,
+                            bool restored_residency = true);
 // Disk save without a host copy: the layer's authoritative K/V as a streamed source (same bytes and metadata as
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
@@ -60,6 +61,12 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+// Default-off native diagnostics call these only at a drained ownership boundary.
+// Streaming readback uses bounded64KiB scratch, no second full image.
+bool conversation_snapshot_verify(const SavedConversation&,const SessionState&,const ModelGeometry&,
+                                  uint64_t& fingerprint,std::string& error);
+bool conversation_live_fingerprint(const SessionState&,const ModelGeometry&,int64_t upto,
+                                   uint64_t& fingerprint,std::string& error);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;
