@@ -6,9 +6,10 @@ import tempfile
 import threading
 import time
 import unittest
-from serve.priority_scheduler import Role, PriorityScheduler, PriorityUnavailable, PriorityProtocolError
+from serve.priority_scheduler import (Role, PriorityScheduler, PriorityUnavailable, PriorityProtocolError,
+                                      PriorityQueueFull)
 from serve.test_priority_scheduler import Clock
-from serve.server import StrataEngine, engine_args, Service, ByteTokenizer, EngineDied
+from serve.server import StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer, EngineDied
 from serve.frontend import ChatTemplate
 
 FAKE_PRIORITY = r'''
@@ -166,6 +167,75 @@ class ProtocolTests(PipeFixture):
         self.assertEqual(e.priority.requests,{})
         self.assertIn('PCANCEL 1',self.events.read_text())
         self.assertNotIn('STOP',self.events.read_text())
+    def test_queued_cancel_wakes_reserve_priority_at_once(self):
+        e=self.start(b'x'*100)
+        out=[];cancel=threading.Event()
+        busy=threading.Thread(target=lambda:out.extend(e.generate([1,2,3],200,{},cancel)))
+        busy.start();self.wait(lambda:len(out)>2)          # the engine is busy: a foreground stays queued
+        wake=threading.Event();results=[]
+        def reserve():
+            wake.set()
+            try:e.reserve_priority([4,5],20,{},threading.Event(),timeout=120)
+            except Exception as error:results.append(error)
+        waiter=threading.Thread(target=reserve);waiter.start();wake.wait()
+        self.wait(lambda:any(r.role is Role.HERMES and r.state=='queued'
+                             for r in e.priority.requests.values()))
+        queued=next(r for r in e.priority.requests.values()
+                    if r.role is Role.HERMES and r.state=='queued')
+        began=time.monotonic();e.priority.cancel(queued)
+        waiter.join(5);took=time.monotonic()-began
+        self.assertFalse(waiter.is_alive())
+        self.assertLess(took,5)                            # no wait out to the admission deadline
+        self.assertEqual(len(results),1)
+        self.assertIsInstance(results[0],PriorityUnavailable)
+        self.assertIn('cancelled before admission',str(results[0]))
+        e.priority.release(queued)
+        cancel.set();busy.join(5);self.assertFalse(busy.is_alive())
+    def test_wait_events_surface_as_stream_notes(self):
+        e=self.start(b'x'*100);items=[]
+        def run():
+            for token in e.generate([1,2,3],200,{},threading.Event()):
+                items.append((token,getattr(e,'stream_note',None)))
+                if items and items[-1][0] is None:break    # the heartbeat that carries the note
+        t=threading.Thread(target=run);t.start()
+        self.wait(lambda:e.priority.active==1)
+        e.priority.requests[1].events.put('WAIT priority resume_refused attempt=3 reason=resume_unavailable')
+        t.join(5);self.assertFalse(t.is_alive())
+        self.assertIn((None,'priority resume_refused attempt=3 reason=resume_unavailable'),items)
+        self.assertIn('PCANCEL 1',self.wait_for(lambda:self.events.read_text()))
+    def wait_for(self,produce,timeout=3):
+        end=time.monotonic()+timeout;text=produce()
+        while not text and time.monotonic()<end:time.sleep(.001);text=produce()
+        return text
+    def test_sse_keepalive_carries_one_pending_note_then_plain_keepalive(self):
+        engine=type('Engine',(),{'stream_note':'priority resume_refused attempt=3 reason=resume_unavailable'})()
+        self.assertEqual(sse_keepalive(engine),b': priority resume_refused attempt=3 reason=resume_unavailable\n\n')
+        self.assertEqual(sse_keepalive(engine),b': keep-alive\n\n')    # a note is consumed once
+        self.assertEqual(sse_keepalive(type('Idle',(),{})()),b': keep-alive\n\n')
+    def test_priority_queue_limits_config_validation(self):
+        self.assertEqual(priority_queue_limits({}),(64,8*1024*1024))
+        self.assertEqual(priority_queue_limits({'priority':{}}),(64,8*1024*1024))
+        self.assertEqual(priority_queue_limits({'priority':{'max_queued_requests':3}}),(3,8*1024*1024))
+        self.assertEqual(priority_queue_limits({'priority':{'max_queued_command_bytes':4096}}),(64,4096))
+        for bad in ({'priority':{'max_queued_requests':0}},{'priority':{'max_queued_requests':True}},
+                    {'priority':{'max_queued_requests':1.5}},{'priority':{'max_queued_command_bytes':-1}},
+                    {'priority':{'max_queued_command_bytes':'8 MiB'}}):
+            with self.assertRaises(ValueError):priority_queue_limits(bad)
+        self.assertIn('--priority-serving',engine_args({'args':[],'priority':{'enabled':True,
+            'max_queued_requests':8,'max_queued_command_bytes':1024}}))
+        with self.assertRaises(ValueError):
+            engine_args({'args':[],'priority':{'enabled':True,'max_queued_requests':0}})
+    def test_queue_full_refusal_is_typed_before_the_stream_starts(self):
+        e=self.start(b'x'*100)
+        out=[];cancel=threading.Event()
+        busy=threading.Thread(target=lambda:out.extend(e.generate([1,2,3],200,{},cancel)))
+        busy.start();self.wait(lambda:len(out)>2)
+        e.priority.max_queued_requests=0                   # nothing may queue behind the running request
+        with self.assertRaises(PriorityQueueFull):
+            e.reserve_priority([4,5],20,{},threading.Event(),timeout=1)
+        # the refused submission left nothing behind: only the running background request remains
+        self.assertEqual([r.role for r in e.priority.requests.values()],[Role.BACKGROUND])
+        cancel.set();busy.join(5);self.assertFalse(busy.is_alive())
     def test_native_failure_after_headers_ends_same_stream(self):
         e=self.start(b'x'*100);cancel=threading.Event()
         svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))

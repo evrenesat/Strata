@@ -1,7 +1,8 @@
 import queue
 import unittest
-from serve.priority_scheduler import (BackfillAdmission, PriorityProtocolError,
-                                      PriorityScheduler, PriorityUnavailable, Role)
+from serve.priority_scheduler import (BackfillAdmission, PriorityQueueFull, PriorityProtocolError,
+                                      PriorityResumeRefusedPersistent, PriorityScheduler,
+                                      PriorityUnavailable, Role)
 
 
 class Clock:
@@ -243,6 +244,120 @@ class SchedulerTests(unittest.TestCase):
     def test_duplicate_terminal_is_fatal(self):
         b=self.bg(); self.done(b); self.done(b)
         self.assertIsNotNone(self.s.dead)
+    def test_resume_refusals_are_commented_counted_and_bounded(self):
+        b = self.park(); self.clock.advance(300); self.s.tick()
+        self.assertEqual(self.sent[-1], 'PRESUME 1')
+        self.s.feed('PREFUSED 1 resume_unavailable')
+        self.assertEqual(b.state, 'parked')
+        self.assertEqual(list(b.events.queue),
+                         ['WAIT priority resume_refused attempt=1 reason=resume_unavailable'])
+        for _ in range(59):                      # 295 s more of refused 5 s retries: still retrying
+            self.clock.advance(5); self.s.tick()
+            self.assertEqual(self.sent[-1], 'PRESUME 1')
+            self.s.feed('PREFUSED 1 resume_unavailable')
+        self.assertEqual(b.events.queue[-1],
+                         'WAIT priority resume_refused attempt=60 reason=resume_unavailable')
+        self.assertEqual(self.s.protocol_evidence[-1], (300.0 + 59*5, 'resume_refused', b.id,
+                                                        'resume_unavailable'))
+        self.clock.advance(5); self.s.tick()     # first refusal + 300 s: the policy stops retrying
+        self.assertEqual(self.sent.count('PRESUME 1'), 60)
+        self.assertEqual(b.state, 'failed')
+        self.assertIsInstance(b.failure, PriorityResumeRefusedPersistent)
+        self.assertIn('priority_resume_refused_persistent', str(b.failure))
+        self.assertIsNone(self.s.parked)
+        self.assertNotIn('PCANCEL 1', self.sent)          # the capsule was neither cancelled nor stopped
+        self.assertNotIn('PSTOP', ' '.join(self.sent))
+        evidence = [e for e in self.s.protocol_evidence if e[1] == 'resume_refused_persistent']
+        self.assertEqual(evidence[-1][2:], (b.id, 'resume_unavailable'))
+        b2 = self.bg()                           # a dropped parked slot never blocks background work
+        self.assertEqual(self.s.active, b2.id)
+    def test_resume_refusal_deadline_is_configurable_and_bounded(self):
+        for bad in (0, 4, -1, 86401):
+            with self.assertRaises(ValueError):
+                PriorityScheduler(lambda _: None, timer=False, resume_retry_deadline_seconds=bad)
+        clock = Clock(); sent = []
+        s = PriorityScheduler(sent.append, clock=clock, timer=False, resume_retry_deadline_seconds=5)
+        b = s.submit('GEN 100 1,2,3'); s.submit('GEN 10 4,5', Role.HERMES)
+        s.feed('PAUSED 1 decode 3 1'); s.feed('R 2 DONE 2 2 1 1 stop 0 0 0')
+        clock.advance(301); s.tick()             # the lease-expiry PRESUME goes out
+        self.assertEqual(sent[-1], 'PRESUME 1')
+        s.feed('PREFUSED 1 resume_unavailable')  # first refusal at t=301: the next retry strands
+        clock.advance(5); s.tick()
+        self.assertEqual(b.state, 'failed')
+        self.assertNotIn('PCANCEL 1', sent)
+    def test_backfill_refusals_do_not_arm_the_resume_deadline(self):
+        b = self.park(); self.s.admit_backfill(BackfillAdmission('a'*64, True, 1, (1, 1, 1)), 'a'*64)
+        self.clock.advance(10); self.s.tick()
+        self.assertEqual(self.sent[-1], 'PRESUME 1 backfill=1')
+        self.s.feed('PREFUSED 1 backfill_unavailable')
+        self.assertEqual(b.state, 'parked')
+        self.assertEqual(b.events.queue[-1], 'WAIT priority backfill_refused reason=backfill_unavailable')
+        self.clock.advance(400); self.s.tick()   # far past any deadline: the plain path is unaffected
+        self.assertEqual(self.sent[-1], 'PRESUME 1')
+        self.assertIsNone(self.s.resume_first_refusal)
+        self.s.feed('PREFUSED 1 resume_unavailable')
+        self.assertEqual(self.s.resume_refusals, 1)
+    def test_malformed_refusal_reason_is_never_echoed(self):
+        b = self.park(); self.clock.advance(300); self.s.tick()
+        self.s.feed('PREFUSED 1 DROP TABLE users; --')
+        self.assertEqual(b.events.queue[-1], 'WAIT priority resume_refused attempt=1 reason=unspecified')
+        self.assertEqual(self.s.protocol_evidence[-1][3], 'unspecified')
+    def test_refused_lease_expires_and_queued_background_starts_immediately(self):
+        b = self.bg(); h = self.fg()                 # A runs, the VIP queues, PPAUSE goes out
+        self.s.feed('PREFUSED 1 pause_unavailable')  # the refusal fails the queued VIP with 503
+        self.assertEqual(h.state, 'failed')
+        self.assertIsInstance(h.events.get_nowait(), PriorityUnavailable)
+        b2 = self.bg()                               # B queues under the refused-only lease
+        self.done(b)                                 # A finishes
+        self.assertEqual(self.s.active, b2.id)       # B starts at once, not after the 300 s lease
+        self.assertEqual(self.clock.now, 0.0)
+    def test_admitted_foreground_keeps_its_lease_over_queued_background(self):
+        b = self.bg(); h = self.fg(); self.pause(b); self.done(h)   # h ran: the lease was used
+        b2 = self.bg()
+        self.s.tick()
+        self.assertIsNone(self.s.active)             # a used lease still blocks background work
+        self.assertEqual(b2.state, 'queued')
+        self.clock.advance(300); self.s.tick()
+        self.assertEqual(self.s.active, b.id)        # the parked request resumes first, as before
+    def test_queued_cancel_completes_admission_and_wakes_the_waiter(self):
+        self.bg()                                    # the engine is busy: the next foreground queues
+        b = self.bg()
+        h = self.fg()
+        self.assertEqual(h.state, 'queued')
+        self.s.cancel(h)
+        self.assertEqual(h.state, 'done')
+        self.assertTrue(h.admitted.is_set())         # the reserve waiter's event completes at once
+        self.assertIsInstance(h.failure, PriorityUnavailable)
+        self.assertIn('cancelled before admission', str(h.failure))
+        self.assertEqual(h.events.get_nowait(), 'DONE 0 0 0 0 cancel 0 0 0')
+        self.assertIsNone(self.s.dead)
+    def test_queue_admission_refuses_only_new_submissions(self):
+        self.s.max_queued_requests = 2
+        b1 = self.s.submit('GEN 100 seed=424242 1,2,3')   # id 1 runs: active requests are exempt
+        h = self.fg()                                     # queued (1) and the running background pauses
+        b2 = self.bg()                                    # queued (2)
+        with self.assertRaises(PriorityQueueFull) as full:
+            self.bg()                                     # two queued already: a third is refused
+        self.assertIn('priority_queue_full', str(full.exception))
+        self.pause(b1)                                    # b1 parks (exempt), h runs: a slot frees
+        b3 = self.bg()
+        self.assertEqual(b3.state, 'queued')              # accepted with 1 queued, 1 parked, 1 running
+        self.done(h)                                      # h ran, so its lease still shields the park...
+        self.clock.advance(300); self.s.tick()            # ...until it lapses: b1 resumes before b3
+        self.assertEqual(self.sent[-1], 'PRESUME 1')
+    def test_queue_admission_bounds_commands_by_bytes(self):
+        s = PriorityScheduler(lambda _: None, clock=self.clock, timer=False,
+                              max_queued_requests=64, max_queued_command_bytes=48)
+        s.submit('GEN 100 seed=424242 1,2,3')        # runs: its bytes never count
+        s.submit('GEN 10 4,5', Role.HERMES)          # 12 bytes queued
+        with self.assertRaises(PriorityQueueFull):
+            s.submit('GEN 10 ' + '8,' * 20 + '8')    # the queued total would pass 48 bytes
+    def test_queue_bounds_must_be_positive_whole_numbers(self):
+        for kwargs in ({'max_queued_requests': 0}, {'max_queued_requests': True},
+                       {'max_queued_requests': 1.5}, {'max_queued_command_bytes': -1},
+                       {'max_queued_command_bytes': '8 MiB'}):
+            with self.assertRaises(ValueError):
+                PriorityScheduler(lambda _: None, timer=False, **kwargs)
 
 
 if __name__=='__main__': unittest.main()

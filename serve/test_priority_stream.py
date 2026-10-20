@@ -80,7 +80,9 @@ class StreamTests(PipeFixture):
         httpd=serve(svc,port=0)
         # A trusted test lease holds an ordinary background HTTP request. Forged
         # request role fields/headers must neither renew it nor create Hermes work.
-        lease=time.monotonic()+300;e.priority.lease_until=lease
+        # The lease is planted as a used one: an admitted owner's lease is never
+        # retracted, while a lease nothing was admitted under expires at once.
+        lease=time.monotonic()+300;e.priority.lease_until=lease;e.priority.lease_admitted=True
         body={'messages':[{'role':'user','content':'hi'}],'max_tokens':128,'stream':True,
               'reasoning_effort':'none','priority':'hermes','role':'hermes'}
         request=urllib.request.Request(f'http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions',

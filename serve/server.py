@@ -58,7 +58,8 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
-from serve.priority_scheduler import PriorityScheduler, Role, PriorityProtocolError, PriorityUnavailable  # noqa: E402
+from serve.priority_scheduler import (PriorityScheduler, Role, PriorityProtocolError,  # noqa: E402
+                                      PriorityUnavailable, PriorityQueueFull)
 from serve.priority_auth import configured_auth, validate_chat  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -570,6 +571,20 @@ def _request_field(name, default=None):
     return property(get,set_value)
 
 
+def sse_keepalive(engine) -> bytes:
+    """The SSE comment written between events: a priority status note when the engine
+    reported one for this request's thread (e.g. a parked request whose resume the engine
+    refused), else the plain keep-alive.  Notes are scheduler-composed tokens, no secrets."""
+    note = getattr(engine, 'stream_note', None)
+    if note:
+        try:
+            engine.stream_note = None
+        except Exception:
+            pass
+        return f": {note}\n\n".encode()
+    return b": keep-alive\n\n"
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -586,6 +601,7 @@ class StrataEngine:
     progress_ms = _request_field('progress_ms',0)
     reused = _request_field('reused',0)
     prefill_tok_s_mean = _request_field('prefill_tok_s_mean')
+    stream_note = _request_field('stream_note')   # one pending priority status note for the SSE comments
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -610,6 +626,9 @@ class StrataEngine:
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.priority_configured = '--priority-serving' in args
         self.priority = None
+        # Bounded queue admission for priority mode (the config's priority section may set
+        # both; see priority_queue_limits): queued requests at most, and their command bytes.
+        self.priority_queue_limits = (64, 8 * 1024 * 1024)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -747,7 +766,9 @@ class StrataEngine:
                 self.close()
                 raise ValueError('priority mode requires the matching serial native protocol')
             owned_proc=self.proc
+            limits = self.priority_queue_limits
             self.priority = PriorityScheduler(self._send, silence_seconds=float(self.silence_s or 120),
+                max_queued_requests=limits[0], max_queued_command_bytes=limits[1],
                 fatal=lambda error:self._priority_fatal(error,owned_proc))
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -1547,6 +1568,13 @@ class StrataEngine:
                     raise line
                 if line.startswith('T '):
                     yield int(line.split()[1])
+                elif line.startswith('WAIT '):
+                    # The scheduler's status for a waiting (parked) request, e.g. a resume the
+                    # engine refused: heartbeat at once and let the SSE layer carry the note.
+                    self.stream_note = line[5:].strip()
+                    beat = time.monotonic()
+                    yield None
+                    continue
                 elif line.startswith('DONE '):
                     self._parse_done(line)
                     done = True
@@ -2160,6 +2188,26 @@ def engine_silence_s(cfg: dict) -> float:
     return float(v)
 
 
+PRIORITY_MAX_QUEUED_REQUESTS = 64                    # priority."max_queued_requests"
+PRIORITY_MAX_QUEUED_COMMAND_BYTES = 8 * 1024 * 1024  # priority."max_queued_command_bytes"
+
+
+def priority_queue_limits(cfg: dict) -> tuple[int, int]:
+    """The priority section's optional queue bounds: how many requests may sit queued and how many
+    command bytes they may hold in total before a new submission is refused with 503
+    priority_queue_full (Retry-After 5).  Running and parked requests never count toward either."""
+    priority = cfg.get('priority')
+    if priority is None:
+        return PRIORITY_MAX_QUEUED_REQUESTS, PRIORITY_MAX_QUEUED_COMMAND_BYTES
+    counts = priority.get('max_queued_requests', PRIORITY_MAX_QUEUED_REQUESTS)
+    bytes_ = priority.get('max_queued_command_bytes', PRIORITY_MAX_QUEUED_COMMAND_BYTES)
+    for name, v in (('"priority"."max_queued_requests"', counts),
+                    ('"priority"."max_queued_command_bytes"', bytes_)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError(f'{name} must be a whole number >= 1, not {v!r}')
+    return counts, bytes_
+
+
 def layer_split_value(cfg: dict) -> str:
     """#644: the config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
     each later GPU's share - one rising number per GPU after the first, e.g. "24,36,42" for 4 GPUs (layers 0-23 on the
@@ -2222,6 +2270,7 @@ def engine_args(cfg: dict) -> list[str]:
         raise ValueError('priority must be an object')
     if priority.get('idle_backfill'):
         raise ValueError('idle backfill requires trusted profile-bound measured admission')
+    priority_queue_limits(cfg)   # the optional queue bounds are validated before launch, too
     if priority.get('enabled') or '--priority-serving' in args:
         if any(k in args for k in ('--batch', '--slots', '--layer-split', '--pipeline-windows', '--lookup-chain')):
             raise ValueError('priority requires a serial single-GPU engine')
@@ -4709,6 +4758,10 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except PriorityQueueFull:
+                self._json(503,{"error":{"type":"priority_queue_full","code":"priority_queue_full",
+                                       "message":"the priority queue is full; retry after 5 seconds"}},
+                           headers={"Retry-After":"5"})
             except PriorityUnavailable:
                 self._json(503,{"error":{"type":"priority_unavailable","code":"priority_unavailable",
                                        "message":"foreground admission unavailable"}},headers={"Retry-After":"5"})
@@ -4998,7 +5051,7 @@ def make_handler(svc: Service):
             try:
                 for c in chunks:
                     if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        self.wfile.write(sse_keepalive(svc.engine))   # an SSE comment: clients ignore it
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
@@ -5098,7 +5151,7 @@ def make_handler(svc: Service):
                             send(asm.in_progress())
                             last = time.monotonic()
                         else:
-                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.write(sse_keepalive(svc.engine))
                     else:
                         send(e)
                         last = time.monotonic()
@@ -5208,7 +5261,7 @@ def make_handler(svc: Service):
             try:
                 for item in events:
                     if item is None:
-                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.write(sse_keepalive(svc.engine))
                     else:
                         name, e = item
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
@@ -5712,6 +5765,10 @@ def main() -> int:
         engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        try:
+            engine.priority_queue_limits = priority_queue_limits(cfg)   # priority mode's bounded queue
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop())

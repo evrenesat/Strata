@@ -22,6 +22,16 @@ class PriorityUnavailable(RuntimeError):
     pass
 
 
+class PriorityQueueFull(PriorityUnavailable):
+    """Bounded queue admission refused a new submission (503, Retry-After 5)."""
+
+
+class PriorityResumeRefusedPersistent(PriorityUnavailable):
+    """The engine persistently refused a parked request's resume: its HTTP stream is closed
+    honestly, but its native capsule was neither cancelled nor stopped."""
+    code = 'priority_resume_refused_persistent'
+
+
 class PriorityProtocolError(RuntimeError):
     pass
 
@@ -76,17 +86,30 @@ class ForegroundTurn:
 
 class PriorityScheduler:
     def __init__(self, send, clock=time.monotonic, lease_seconds=300, silence_seconds=120,
-                 fatal=None, timer=True):
+                 fatal=None, timer=True, resume_retry_deadline_seconds=300,
+                 max_queued_requests=64, max_queued_command_bytes=8*1024*1024):
         if not 1 <= lease_seconds <= 3600 or silence_seconds <= 0:
             raise ValueError('priority requires finite positive timing bounds')
+        # A refused resume retries every 5 s; past this deadline the parked stream is closed
+        # honestly instead of keeping the request (and the engine's background work) suspended.
+        if not 5 <= resume_retry_deadline_seconds <= 86400:
+            raise ValueError('priority requires a bounded resume retry deadline (5..86400 s)')
+        if (isinstance(max_queued_requests, bool) or not isinstance(max_queued_requests, int) or
+                max_queued_requests < 1 or isinstance(max_queued_command_bytes, bool) or
+                not isinstance(max_queued_command_bytes, int) or max_queued_command_bytes < 1):
+            raise ValueError('priority queue bounds must be positive whole numbers')
         self.send, self.clock, self.fatal = send, clock, fatal
         self.lease_seconds, self.silence = lease_seconds, silence_seconds
+        self.resume_retry_deadline = resume_retry_deadline_seconds
+        self.max_queued_requests = max_queued_requests
+        self.max_queued_command_bytes = max_queued_command_bytes
         self.lock = threading.RLock()
         self.requests = {}
         self.turns = set()
         self.foreground, self.background = deque(), deque()
         self.active = self.parked = None
         self.lease_until = 0.0
+        self.lease_admitted = False     # a foreground request actually ran under the current lease
         self.idle_since = clock()
         self.next_id = 1
         self.dead = None
@@ -96,6 +119,14 @@ class PriorityScheduler:
         self.backfill = False
         self.backfill_disabled_until = 0
         self.resume_retry_at = 0
+        # The parked request's refusal episode: plain (lease-expiry) resume refusals repeat
+        # every 5 s, so they are counted and bounded; backfill refusals are already damped
+        # to one attempt per lease (backfill_disabled_until) and do not burn this deadline.
+        self.resume_refusals = 0
+        self.resume_first_refusal = None
+        self.resume_last_reason = None
+        # Bounded protocol evidence: refusal reason codes the engine actually sent.
+        self.protocol_evidence = deque(maxlen=64)
         if timer:
             threading.Thread(target=self._timer, daemon=True).start()
 
@@ -146,6 +177,11 @@ class PriorityScheduler:
                 raise PriorityProtocolError('foreign or closed foreground turn')
             if self.next_id >= 2**63:
                 raise PriorityProtocolError('priority request IDs exhausted')
+            queued = [q for q in self.requests.values() if q.state == 'queued']
+            if (len(queued) >= self.max_queued_requests or
+                    sum(len(q.command) for q in queued) + len(command) > self.max_queued_command_bytes):
+                # Only new submissions are refused; running and parked requests never count.
+                raise PriorityQueueFull('priority_queue_full; retry after 5 seconds')
             r = Request(self.next_id, command, role, heard=self.clock(), allowance=self.silence)
             r.origin,r.turn=self,turn
             r.max_new, r.prompt_tokens = int(fields[1]), len(fields[-1].split(','))
@@ -159,6 +195,8 @@ class PriorityScheduler:
                 if turn is None or not turn.admitted:
                     now=self.clock()
                     fallback_active=now<self.lease_until and self.backfill_disabled_until>=self.lease_until
+                    if now >= self.lease_until:
+                        self.lease_admitted = False   # a fresh lease starts with nothing admitted under it
                     self.lease_until = max(self.lease_until, at + self.lease_seconds)
                     if fallback_active:
                         self.backfill_disabled_until=self.lease_until
@@ -186,34 +224,44 @@ class PriorityScheduler:
             r = self.requests[self.foreground.popleft()]
         elif any(turn.admitted and not turn.closed for turn in self.turns):
             return  # The admitted HTTP owner is between native continuations.
-        elif self.clock() < self.lease_until:
-            if (self.parked is None or not self.backfill or self.clock() < self.backfill_disabled_until or
-                    self.clock()-self.idle_since < 10):
-                return
-            r = self.requests[self.parked]
-            if r.state != 'parked' or self.clock() < self.resume_retry_at:
-                return
-            self.active = r.id
-            r.state, r.heard, r.allowance, r.backfill = 'resuming', self.clock(), 180.0, True
-            r.control = 'resume'
-            self._write(f'PRESUME {r.id} backfill=1')
-            return
-        elif self.parked is not None:
-            r = self.requests[self.parked]
-            if r.state != 'parked' or self.clock() < self.resume_retry_at:
-                return
-            r.backfill = False
-            self.active = r.id
-            r.state, r.heard, r.allowance = 'resuming', self.clock(), 180.0
-            r.control = 'resume'
-            self._write(f'PRESUME {r.id}')
-            return
-        elif self.background:
-            r = self.requests[self.background.popleft()]
         else:
-            return
+            if self.clock() < self.lease_until and not self.lease_admitted:
+                # No foreground ever ran under this lease, none is queued and none is in
+                # flight: it protects nobody, so it expires now and background proceeds
+                # when the engine is next idle instead of after the full lease.
+                self.lease_until = self.clock()
+            if self.clock() < self.lease_until:
+                if (self.parked is None or not self.backfill or self.clock() < self.backfill_disabled_until or
+                        self.clock()-self.idle_since < 10):
+                    return
+                r = self.requests[self.parked]
+                if r.state != 'parked' or self.clock() < self.resume_retry_at:
+                    return
+                self.active = r.id
+                r.state, r.heard, r.allowance, r.backfill = 'resuming', self.clock(), 180.0, True
+                r.control = 'resume'
+                self._write(f'PRESUME {r.id} backfill=1')
+                return
+            elif self.parked is not None:
+                r = self.requests[self.parked]
+                if r.state != 'parked' or self.clock() < self.resume_retry_at:
+                    return
+                if self._resume_refused_past_deadline(r):
+                    return
+                r.backfill = False
+                self.active = r.id
+                r.state, r.heard, r.allowance = 'resuming', self.clock(), 180.0
+                r.control = 'resume'
+                self._write(f'PRESUME {r.id}')
+                return
+            elif self.background:
+                r = self.requests[self.background.popleft()]
+            else:
+                return
         self.active = r.id
         r.state, r.heard, r.started = 'running', self.clock(), True
+        if r.role is Role.HERMES:
+            self.lease_admitted = True   # this lease has now actually served a foreground request
         verb, rest = r.command.split(' ', 1)
         self._write(f'P{verb} {r.id} {rest}')
         r.admitted.set()
@@ -226,13 +274,53 @@ class PriorityScheduler:
                 return
             if r.state == 'queued':
                 r.state = 'done'
+                # Complete the admission state so a thread waiting in reserve_priority wakes
+                # at once with a typed cancellation instead of spinning to its deadline.
+                r.failure = PriorityUnavailable('priority reservation cancelled before admission')
                 r.events.put('DONE 0 0 0 0 cancel 0 0 0')
+                r.admitted.set()
                 self._dispatch()
             elif not r.cancel_sent:
                 r.cancel_sent = True
                 r.state = 'cancelling'
                 r.heard, r.allowance = self.clock(), 180.0
                 self._write(f'PCANCEL {r.id}')
+
+    @staticmethod
+    def _reason_token(text):
+        """The engine's refusal reason, reduced to a safe comment token (never client data)."""
+        if 0 < len(text) <= 64 and all(c == '_' or '0' <= c <= '9' or 'a' <= c <= 'z' for c in text):
+            return text
+        return 'unspecified'
+
+    def _resume_refused_past_deadline(self, r):
+        """True once the parked request's plain-resume refusals passed the bounded policy."""
+        if (self.resume_first_refusal is None or r.cancel_sent or
+                self.clock() - self.resume_first_refusal < self.resume_retry_deadline):
+            return False
+        self._strand_parked(r)
+        return True
+
+    def _strand_parked(self, r):
+        """Persistent resume refusal: close the parked request's stream with a typed error
+        and stop retrying.  The native capsule is neither cancelled nor stopped (no PCANCEL
+        or STOP goes out): the engine keeps it parked and - verified against the engine's
+        serve loop - runs new background generations beside a parked capsule, so dropping
+        the parked slot here unblocks background work while the capsule stays recoverable
+        by a later trusted PRESUME until the engine itself ends."""
+        reason = self.resume_last_reason or 'unspecified'
+        attempts = self.resume_refusals
+        self.protocol_evidence.append((self.clock(), 'resume_refused_persistent', r.id, reason))
+        self.resume_refusals, self.resume_first_refusal, self.resume_last_reason = 0, None, None
+        self.parked = None
+        r.state, r.control = 'failed', None
+        r.failure = PriorityResumeRefusedPersistent(
+            f'{PriorityResumeRefusedPersistent.code}: the engine refused resume {attempts} time(s) over '
+            f'{self.resume_retry_deadline:.0f} s (last reason {reason}); the request was not cancelled '
+            'and its parked state is kept in the engine')
+        r.events.put(r.failure)
+        r.admitted.set()
+        self._dispatch()
 
     def _finish(self, r, line):
         if r.state in ('done', 'failed'):
@@ -286,6 +374,7 @@ class PriorityScheduler:
             r.state = 'cancelling' if r.cancel_sent else 'parked'
             r.control = None
             self.parked, self.active = r.id, None
+            self.resume_refusals, self.resume_first_refusal, self.resume_last_reason = 0, None, None
             self._dispatch()
         elif parts[0] == 'RESUMED':
             if self.active != r.id or r.state not in ('resuming', 'cancelling'):
@@ -294,23 +383,43 @@ class PriorityScheduler:
             r.state = 'cancelling' if r.cancel_sent else 'running'
             r.control = None
             r.heard, r.allowance = self.clock(), self.silence
+            self.resume_refusals, self.resume_first_refusal, self.resume_last_reason = 0, None, None
             if self.foreground and not r.cancel_sent:
                 r.state = 'pausing'
                 r.control = 'pause'
                 self._write(f'PPAUSE {r.id}')
         elif parts[0] == 'PREFUSED':
+            reason = self._reason_token(parts[2] if len(parts) > 2 else '')
             if self.active == r.id and r.control=='resume' and r.state in ('resuming','cancelling'):
+                was_backfill = r.backfill
                 self.active, r.state = None, 'cancelling' if r.cancel_sent else 'parked'
                 r.control = None
                 self.resume_retry_at = self.clock()+5
-                if r.backfill:
+                if was_backfill:
                     self.backfill_disabled_until = self.lease_until
                 r.backfill = False
-                r.events.put('WAIT resume_unavailable')
+                kind = 'backfill_refused' if was_backfill else 'resume_refused'
+                self.protocol_evidence.append((self.clock(), kind, r.id, reason))
+                if was_backfill:
+                    # Backfill refusals are damped to one attempt per lease; the comment
+                    # still tells the parked client about the memory pressure.
+                    r.events.put(f'WAIT priority backfill_refused reason={reason}')
+                else:
+                    # A plain resume refusal retries every 5 s: the attempt is counted and
+                    # the whole episode is bounded by resume_retry_deadline_seconds.
+                    self.resume_refusals += 1
+                    if self.resume_first_refusal is None:
+                        self.resume_first_refusal = self.clock()
+                    self.resume_last_reason = reason
+                    r.events.put(f'WAIT priority resume_refused attempt={self.resume_refusals} '
+                                 f'reason={reason}')
+                if not r.cancel_sent and not was_backfill and self._resume_refused_past_deadline(r):
+                    return
                 self._dispatch()
                 return
             if self.active != r.id or r.control!='pause' or r.state not in ('pausing','cancelling'):
                 raise PriorityProtocolError('unexpected pause refusal')
+            self.protocol_evidence.append((self.clock(), 'pause_refused', r.id, reason))
             r.state = 'cancelling' if r.cancel_sent else 'running'
             r.control = None
             if r.backfill:
