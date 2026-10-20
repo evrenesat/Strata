@@ -788,8 +788,10 @@ class StrataEngine:
             owned_proc=self.proc
             limits = self.priority_queue_limits
             deadline = self.priority_resume_retry_deadline_seconds
+            configured = silence_s if silence_s is not None else self.silence_s
+            # engine_silence_s: 0 means "wait forever" - an infinite allowance, not 120.
             self.priority = PriorityScheduler(self._send,
-                silence_seconds=float((silence_s if silence_s is not None else self.silence_s) or 120),
+                silence_seconds=math.inf if configured == 0 else float(configured or 120),
                 max_queued_requests=limits[0], max_queued_command_bytes=limits[1],
                 resume_retry_deadline_seconds=deadline if deadline is not None else 300,
                 fatal=lambda error:self._priority_fatal(error,owned_proc))

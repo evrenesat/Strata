@@ -365,6 +365,18 @@ class StreamingQueueFullTests(PipeFixture):
         self.assertIn('response.failed',body)
         self.assertIn('priority_queue_full',body)
 
+    def test_configured_zero_silence_means_no_limit(self):
+        import math
+        e=self.start(priority=True,lazy=True)
+        e.silence_s=0
+        e.restart()                                   # the scheduler is built with 0 carried
+        self.assertEqual(e.priority.silence, math.inf)
+        r=e.priority.submit('GEN 100 1,2,3');self.wait(lambda:r.state=='running')
+        e.priority.clock=lambda: time.monotonic()+10**9   # far past any finite allowance
+        e.priority.tick()                             # an infinite allowance never trips
+        self.assertIsNone(e.priority.dead)
+        self.assertEqual(r.state,'running')
+
     def test_anthropic_stream_surfaces_persistent_resume_refusal_typed(self):
         e=self.start(priority=True,lazy=True)
         svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))

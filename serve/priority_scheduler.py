@@ -389,7 +389,7 @@ class PriorityScheduler:
         # PPAUSE/PCANCEL with `PREFUSED <id> inactive_request`; that can land after the
         # DONE (or after the HTTP side released the id).  It is benign - never poison.
         if (parts[0] == 'PREFUSED' and len(parts) > 2 and parts[2].split()[:1] == ['inactive_request']
-                and int(parts[1]) not in self.retiring):
+                and int(parts[1]) < self.next_id and int(parts[1]) not in self.retiring):
             self.protocol_evidence.append((self.clock(), 'late_control_refused', int(parts[1]),
                                            'inactive_request'))
             self._dispatch()
@@ -446,14 +446,6 @@ class PriorityScheduler:
                 self._write(f'PPAUSE {r.id}')
         elif parts[0] == 'PREFUSED':
             reason = self._reason_token(parts[2] if len(parts) > 2 else '')
-            if (r.state in ('done', 'failed') and
-                    parts[2].split()[:1] == ['inactive_request']):
-                # The request finished naturally while its control was in flight; the
-                # engine erased it and answered the late PPAUSE/PCANCEL.  Nothing to do.
-                self.protocol_evidence.append((self.clock(), 'late_control_refused', r.id,
-                                               'inactive_request'))
-                self._dispatch()
-                return
             if self.active == r.id and r.control=='resume' and r.state in ('resuming','cancelling'):
                 was_backfill = r.backfill
                 self.active, r.state = None, 'cancelling' if r.cancel_sent else 'parked'
