@@ -108,6 +108,7 @@ class PriorityScheduler:
         self.turns = set()
         self.foreground, self.background = deque(), deque()
         self.active = self.parked = None
+        self.retiring = {}   # id -> Request: stranded capsules whose PCANCEL terminal is still owed
         self.lease_until = 0.0
         self.lease_admitted = False     # a foreground request actually ran under the current lease
         self.idle_since = clock()
@@ -214,8 +215,8 @@ class PriorityScheduler:
             return r
 
     def _dispatch(self):
-        if self.dead or self.active is not None:
-            return
+        if self.dead or self.active is not None or self.retiring:
+            return   # let the engine finish a pending PCANCEL before another PPAUSE goes out
         for pending in (self.foreground, self.background):
             while pending and (pending[0] not in self.requests or self.requests[pending[0]].state != 'queued' or
                     (self.requests[pending[0]].turn is not None and self.requests[pending[0]].turn.closed)):
@@ -332,6 +333,7 @@ class PriorityScheduler:
         r.events.put(r.failure)
         r.admitted.set()
         r.cancel_sent = True
+        self.retiring[r.id] = r   # identity survives the HTTP side's release until the terminal
         self._write(f'PCANCEL {r.id}')
         self.protocol_evidence.append((self.clock(), 'stranded_capsule_retired', r.id, 'pcancel'))
         self._dispatch()
@@ -373,6 +375,14 @@ class PriorityScheduler:
             raise PriorityProtocolError('untagged engine output in priority mode')
         if not parts[1].isdecimal() or not 0 < int(parts[1]) < 2**63:
             raise PriorityProtocolError('bad request ID')
+        if int(parts[1]) in self.retiring:
+            retired = self.retiring.pop(int(parts[1]))
+            if parts[0] != 'R':
+                raise PriorityProtocolError('unexpected event for a retiring request')
+            self.protocol_evidence.append((self.clock(), 'stranded_capsule_terminal', retired.id,
+                                           parts[2].split()[0] if parts[2].split() else ''))
+            self._dispatch()
+            return
         r = self.requests[int(parts[1])]
         if parts[0] == 'PAUSED':
             if self.active != r.id or r.state not in ('pausing', 'cancelling') or self.parked is not None:
@@ -539,6 +549,10 @@ class PriorityScheduler:
                 raise PriorityProtocolError('cannot release a live request')
             self.foreground = deque(i for i in self.foreground if i != r.id)
             self.background = deque(i for i in self.background if i != r.id)
+            if getattr(r, 'stranded', False) and self.retiring.get(r.id) is r:
+                # The engine still owes this request's PCANCEL terminal; keep the identity
+                # registered (under the retirement record) so the acknowledgment finds it.
+                self.retiring[r.id] = r
             self.requests.pop(r.id, None)
 
     def admit_backfill(self, admission: BackfillAdmission, profile_sha256: str):

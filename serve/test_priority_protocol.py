@@ -3,13 +3,15 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import threading
 import time
 import unittest
 from serve.priority_scheduler import (Role, PriorityScheduler, PriorityUnavailable, PriorityProtocolError,
                                       PriorityQueueFull)
 from serve.test_priority_scheduler import Clock
-from serve.server import StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer, EngineDied
+from serve.server import StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer, EngineDied, serve
 from serve.frontend import ChatTemplate
 
 FAKE_PRIORITY = r'''
@@ -320,6 +322,62 @@ class ProtocolTests(PipeFixture):
             self.assertLess(commands.index('PGEN 3'),commands.index('PRESUME 1'))
         finally:
             cancel.set();e.close();t.join(3)
+
+
+class StreamingQueueFullTests(PipeFixture):
+    """The byte-bound queue refusal on the streaming endpoints: real HTTP, machine-readable
+    code in each endpoint's error-event format after headers are committed."""
+
+    def start_http(self, bytes_limit):
+        e=self.start(priority=True,lazy=True)
+        e.priority_queue_limits=(64,bytes_limit)   # read when the lazy scheduler is created
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd=serve(svc,port=0)
+        self.addCleanup(httpd.shutdown);self.addCleanup(httpd.server_close)
+        self.addCleanup(e.close)
+        return svc,f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def post_stream(self,base,path,body):
+        request=urllib.request.Request(base+path,data=json.dumps(body).encode(),
+            headers={'Content-Type':'application/json'})
+        try:
+            with urllib.request.urlopen(request,timeout=10) as r:
+                return r.status,r.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code,error.read().decode()
+
+    def test_anthropic_stream_surfaces_priority_queue_full_after_headers(self):
+        svc,base=self.start_http(bytes_limit=8)   # any real command exceeds the byte bound
+        status,body=self.post_stream(base,'/v1/messages',
+            {'model':'m','max_tokens':8,'stream':True,'messages':[{'role':'user','content':'hello'}]})
+        self.assertEqual(status,200)              # headers were already committed
+        self.assertIn('event: error',body)
+        self.assertIn('priority_queue_full',body)
+        self.assertNotIn('keep-alive',body.split('event: error')[0][-40:])
+
+    def test_responses_stream_surfaces_priority_queue_full_after_headers(self):
+        svc,base=self.start_http(bytes_limit=8)
+        status,body=self.post_stream(base,'/v1/responses',
+            {'model':'m','stream':True,'input':'hello'})
+        self.assertEqual(status,200)
+        self.assertIn('response.failed',body)
+        self.assertIn('priority_queue_full',body)
+
+    def test_preheader_check_bypasses_an_admitted_vip_reservation(self):
+        from serve.server import priority_preheader_queue_full
+        svc,base=self.start_http(bytes_limit=8*1024*1024)
+        e=svc.engine
+        e.restart()                               # lazy: __init__ runs now, with the limits above
+        e.priority.max_queued_requests=1
+        a=e.priority.submit('GEN 100 1,2,3')      # admitted: running, not queued
+        b=e.priority.submit('GEN 100 4,5,6')      # a owns the engine: b is the one queued slot
+        self.assertEqual(b.state,'queued')
+        self.assertTrue(e.priority.queue_full())
+        self.assertTrue(priority_preheader_queue_full(svc))
+        with svc.trusted_priority_role(Role.HERMES):
+            svc._priority_role.reservation=object()   # an admitted foreground reservation
+            self.assertFalse(priority_preheader_queue_full(svc))
+            svc._priority_role.reservation=None
 
 
 if __name__=='__main__':unittest.main()

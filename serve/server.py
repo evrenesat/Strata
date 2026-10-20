@@ -571,6 +571,18 @@ def _request_field(name, default=None):
     return property(get,set_value)
 
 
+def priority_preheader_queue_full(svc) -> bool:
+    """The count-bound pre-header check for streaming requests.  An already-admitted VIP
+    reservation bypasses it: its admission is atomic and pre-header by construction
+    (reserve_priority submits before any headers), so the check only ever refuses ordinary
+    background submissions.  For those it is a best-effort snapshot taken before headers; a
+    concurrent admission that slips past it degrades to the machine-readable in-stream
+    priority_queue_full event, never to a wrong 503 for an admitted request."""
+    if getattr(getattr(svc, '_priority_role', None), 'reservation', None) is not None:
+        return False
+    return bool(getattr(svc.engine, 'priority_queue_full', lambda: False)())
+
+
 def sse_keepalive(engine) -> bytes:
     """The SSE comment written between events: a priority status note when the engine
     reported one for this request's thread (e.g. a parked request whose resume the engine
@@ -890,6 +902,9 @@ class StrataEngine:
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
         info = dict(self.info)
+        # The priority bounds live on self so a plain restart() keeps them; __init__ would
+        # otherwise reset them to the defaults on the re-run below.
+        priority_limits, priority_deadline = self.priority_queue_limits, self.priority_resume_retry_deadline_seconds
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
             self.close()
@@ -899,7 +914,8 @@ class StrataEngine:
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)
+                    self.__init__(*self.spawn, priority_queue_limits=priority_limits,
+                                  priority_resume_retry_deadline_seconds=priority_deadline)
                     break
                 except RuntimeError:
                     try:
@@ -5074,7 +5090,7 @@ def make_handler(svc: Service):
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
-            if getattr(svc.engine, 'priority_queue_full', lambda: False)():
+            if priority_preheader_queue_full(svc):
                 # Pre-header admission (count bound): a queued-slot shortage is refused as a
                 # real HTTP 503 with a machine-readable code, not as an in-stream event the
                 # client may treat as the model's answer (the byte bound stays at submit).
@@ -5171,7 +5187,7 @@ def make_handler(svc: Service):
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
-            if getattr(svc.engine, 'priority_queue_full', lambda: False)():
+            if priority_preheader_queue_full(svc):
                 # Pre-header admission (count bound): a queued-slot shortage is refused as a
                 # real HTTP 503 with a machine-readable code, not as an in-stream event the
                 # client may treat as the model's answer (the byte bound stays at submit).
@@ -5201,6 +5217,8 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
+            except PriorityQueueFull as e:                   # mid-stream: response.failed with the queue code
+                self._responses_failed(asm, str(e), "priority_queue_full", send)
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
@@ -5298,7 +5316,7 @@ def make_handler(svc: Service):
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
-            if getattr(svc.engine, 'priority_queue_full', lambda: False)():
+            if priority_preheader_queue_full(svc):
                 # Pre-header admission (count bound): a queued-slot shortage is refused as a
                 # real HTTP 503 with a machine-readable code, not as an in-stream event the
                 # client may treat as the model's answer (the byte bound stays at submit).
@@ -5317,6 +5335,10 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()
                 events.close()
+            except PriorityQueueFull as e:                   # mid-stream: Anthropic's error event, queue code
+                err = {"type": "error", "error": {"type": "api_error", "code": "priority_queue_full", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])

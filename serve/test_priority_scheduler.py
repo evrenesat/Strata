@@ -269,7 +269,15 @@ class SchedulerTests(unittest.TestCase):
         self.assertNotIn('PSTOP', ' '.join(self.sent))
         evidence = [e for e in self.s.protocol_evidence if e[1] == 'resume_refused_persistent']
         self.assertEqual(evidence[-1][2:], (b.id, 'resume_unavailable'))
+        # The HTTP generator's finally may release the failed request BEFORE the engine's
+        # PCANCEL terminal arrives: identity must survive in the retirement registry and the
+        # acknowledgment must be consumed without poisoning the engine.
+        self.s.release(b)
+        self.assertNotIn(b.id, self.s.requests)
+        self.assertIn(b.id, self.s.retiring)
         self.s.feed('R 1 DONE 3 3 0 0 cancel 0 0 0')      # the retirement's terminal is consumed quietly
+        self.assertEqual(self.s.retiring, {})
+        self.assertIsNone(self.s.dead)
         self.assertEqual(b.state, 'failed')
         b2 = self.bg()                           # a dropped parked slot never blocks background work
         self.assertEqual(self.s.active, b2.id)
