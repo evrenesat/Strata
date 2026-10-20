@@ -108,7 +108,8 @@ class PriorityScheduler:
         self.turns = set()
         self.foreground, self.background = deque(), deque()
         self.active = self.parked = None
-        self.retiring = {}   # id -> Request: stranded capsules whose PCANCEL terminal is still owed
+        self.retiring = {}   # id -> (Request, ack deadline): stranded capsules whose PCANCEL terminal is still owed
+        self.retire_ack_seconds = 120   # a PCANCEL acknowledgment is a fast pipe round trip; past this the engine is stuck
         self.lease_until = 0.0
         self.lease_admitted = False     # a foreground request actually ran under the current lease
         self.idle_since = clock()
@@ -333,7 +334,7 @@ class PriorityScheduler:
         r.events.put(r.failure)
         r.admitted.set()
         r.cancel_sent = True
-        self.retiring[r.id] = r   # identity survives the HTTP side's release until the terminal
+        self.retiring[r.id] = (r, self.clock() + self.retire_ack_seconds)   # identity survives the HTTP side's release until the terminal
         self._write(f'PCANCEL {r.id}')
         self.protocol_evidence.append((self.clock(), 'stranded_capsule_retired', r.id, 'pcancel'))
         self._dispatch()
@@ -376,11 +377,21 @@ class PriorityScheduler:
         if not parts[1].isdecimal() or not 0 < int(parts[1]) < 2**63:
             raise PriorityProtocolError('bad request ID')
         if int(parts[1]) in self.retiring:
-            retired = self.retiring.pop(int(parts[1]))
+            retired, _deadline = self.retiring[int(parts[1])]
+            payload = parts[2] if len(parts) > 2 else ''
             if parts[0] != 'R':
                 raise PriorityProtocolError('unexpected event for a retiring request')
-            self.protocol_evidence.append((self.clock(), 'stranded_capsule_terminal', retired.id,
-                                           parts[2].split()[0] if parts[2].split() else ''))
+            if payload.startswith('FATAL '):
+                raise PriorityProtocolError('priority retirement ended fatal')
+            if not payload.startswith('DONE '):
+                raise PriorityProtocolError('retiring request emitted nonterminal output')
+            fields = payload.split()
+            if (len(fields) < 6 or not fields[1].isdecimal() or not fields[2].isdecimal() or
+                    int(fields[1]) > retired.max_new or int(fields[2]) != retired.prompt_tokens or
+                    fields[5] != 'cancel'):
+                raise PriorityProtocolError('invalid retirement terminal')
+            self.retiring.pop(int(parts[1]))
+            self.protocol_evidence.append((self.clock(), 'stranded_capsule_terminal', retired.id, 'cancel'))
             self._dispatch()
             return
         r = self.requests[int(parts[1])]
@@ -512,6 +523,13 @@ class PriorityScheduler:
             for r in self.requests.values():
                 if r.state == 'cancelling' and self.clock() - r.heard > r.allowance:
                     self.fail(PriorityProtocolError('priority cancellation was not acknowledged'))
+                    return
+            for rid, (retired, deadline) in list(self.retiring.items()):
+                if self.clock() > deadline:
+                    # A living engine that never acknowledges the retirement leaves the
+                    # single park slot (and this scheduler) stuck forever: fail honestly so
+                    # the normal restart mechanism recovers both.
+                    self.fail(PriorityProtocolError('priority retirement was not acknowledged'))
                     return
             self._dispatch()
 

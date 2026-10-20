@@ -325,6 +325,37 @@ class SchedulerTests(unittest.TestCase):
                 server.priority_resume_retry_deadline(
                     {'priority': {'resume_retry_deadline_seconds': bad}})
 
+    def test_retirement_ack_timeout_fails_the_engine(self):
+        b = self.park(); self.clock.advance(300); self.s.tick()
+        self.s.feed('PREFUSED 1 resume_unavailable')
+        for _ in range(59):                      # 295 s more of refused 5 s retries
+            self.clock.advance(5); self.s.tick()
+            self.assertEqual(self.sent[-1], 'PRESUME 1')
+            self.s.feed('PREFUSED 1 resume_unavailable')
+        self.clock.advance(5); self.s.tick()     # past the deadline: the policy strands
+        self.assertEqual(self.sent[-1], 'PCANCEL 1')
+        self.assertIn(1, self.s.retiring)
+        self.clock.advance(self.s.retire_ack_seconds + 1); self.s.tick()
+        self.assertIsNotNone(self.s.dead)                    # withheld ack: honest engine failure
+        self.assertIn('retirement was not acknowledged', str(self.s.dead))
+    def test_retirement_terminal_is_validated_before_the_barrier_drops(self):
+        b = self.park(); self.clock.advance(300); self.s.tick()
+        self.s.feed('PREFUSED 1 resume_unavailable')
+        for _ in range(59):                      # 295 s more of refused 5 s retries
+            self.clock.advance(5); self.s.tick()
+            self.assertEqual(self.sent[-1], 'PRESUME 1')
+            self.s.feed('PREFUSED 1 resume_unavailable')
+        self.clock.advance(5); self.s.tick()     # past the deadline: the policy strands
+        self.clock.advance(5); self.s.tick()
+        self.assertEqual(self.sent[-1], 'PCANCEL 1')
+        self.s.release(b)                        # the HTTP side may release before the ack
+        # a token line for the retiring id is protocol poison before any barrier drop
+        before = len(self.sent)
+        self.s.feed('R 1 T 5')
+        self.assertIsNotNone(self.s.dead)                   # nonterminal output: engine fails
+        self.assertIn(1, self.s.retiring)                   # the record was not released
+        self.assertEqual(len(self.sent), before)            # no new dispatch slipped through
+
     def test_backfill_refusals_do_not_arm_the_resume_deadline(self):
         b = self.park(); self.s.admit_backfill(BackfillAdmission('a'*64, True, 1, (1, 1, 1)), 'a'*64)
         self.clock.advance(10); self.s.tick()

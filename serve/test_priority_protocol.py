@@ -11,7 +11,7 @@ import unittest
 from serve.priority_scheduler import (Role, PriorityScheduler, PriorityUnavailable, PriorityProtocolError,
                                       PriorityQueueFull)
 from serve.test_priority_scheduler import Clock
-from serve.server import StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer, EngineDied, serve
+from serve.server import StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer, EngineDied, Role, serve
 from serve.frontend import ChatTemplate
 
 FAKE_PRIORITY = r'''
@@ -362,6 +362,36 @@ class StreamingQueueFullTests(PipeFixture):
         self.assertEqual(status,200)
         self.assertIn('response.failed',body)
         self.assertIn('priority_queue_full',body)
+
+    def test_anthropic_stream_surfaces_persistent_resume_refusal_typed(self):
+        e=self.start(priority=True,lazy=True)
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd=serve(svc,port=0);self.addCleanup(httpd.shutdown);self.addCleanup(httpd.server_close);self.addCleanup(e.close)
+        body=json.dumps({'model':'m','max_tokens':400,'stream':True,
+                         'messages':[{'role':'user','content':'hello'}]}).encode()
+        result={}
+        def bg():
+            try:
+                r=urllib.request.urlopen(urllib.request.Request(
+                    f'http://127.0.0.1:{httpd.server_address[1]}/v1/messages',data=body,
+                    headers={'Content-Type':'application/json'}),timeout=30)
+                result['body']=r.read().decode()
+            except Exception as error:result['error']=repr(error)
+        thread=threading.Thread(target=bg);thread.start()
+        self.wait(lambda:Path(str(self.events)).exists() and 'PGEN 1' in Path(str(self.events)).read_text())
+        h=e.priority.submit('GEN 10 9,8',Role.HERMES)          # parks the background stream
+        self.wait(lambda:e.priority.parked==1 and h.state=='done')
+        # Backdate the refusal episode, suppress the next PRESUME on the wire, and let the
+        # in-flight resume attempt be refused: stranding requires a real refusal context.
+        e.priority.resume_first_refusal=e.priority.clock()-(e.priority.resume_retry_deadline+1)
+        e.priority.resume_refusals=3
+        real_write=e.priority._write
+        e.priority._write=lambda line: None if line.startswith('PRESUME') else real_write(line)
+        e.priority.lease_until=0;e.priority.tick()
+        e.priority.feed('PREFUSED 1 resume_unavailable')
+        thread.join(20);self.assertFalse(thread.is_alive())
+        self.assertIn('priority_resume_refused_persistent',result.get('body',''))
+        self.assertIn('event: error',result.get('body',''))
 
     def test_preheader_check_bypasses_an_admitted_vip_reservation(self):
         from serve.server import priority_preheader_queue_full

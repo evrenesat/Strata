@@ -162,6 +162,33 @@ int main() {
         check(conversation_memory_bound(12345 * 1024, tree.read()) == 12345 * 1024,
               "the v1 no-limit sentinel leaves the host view alone");
     }
+    // Hierarchical v2: an "unlimited" leaf is still bounded by a finite ancestor limit.
+    {
+        CgroupTree tree("strata-cgmem-nest");
+        tree.write(tree.proc(), "0::/user.slice/app.slice/strata.service\n");
+        tree.write(tree.root / "user.slice/app.slice/strata.service/memory.max", "max\n");
+        tree.write(tree.root / "user.slice/app.slice/strata.service/memory.current", "100\n");
+        tree.write(tree.root / "user.slice/app.slice/memory.max", "max\n");
+        tree.write(tree.root / "user.slice/app.slice/memory.current", "0\n");
+        tree.write(tree.root / "user.slice/memory.max", "8000\n");
+        tree.write(tree.root / "user.slice/memory.current", "1000\n");
+        check(tree.read().available == 7000, "the finite ancestor binds an unlimited leaf");
+        tree.write(tree.root / "user.slice/app.slice/memory.max", "3000\n");
+        tree.write(tree.root / "user.slice/app.slice/memory.current", "100\n");
+        check(tree.read().available == 2900, "the tightest level in the hierarchy wins");
+        tree.write(tree.root / "user.slice/memory.current", "bogus\n");
+        check(!conversation_memory_bound(600, tree.read()), "an unreadable ancestor fails closed");
+    }
+    // Hierarchical v1: the memory hierarchy under <root>/memory walks the same way.
+    {
+        CgroupTree tree("strata-cgmem-nest-v1");
+        tree.write(tree.proc(), "9:memory:/job/leaf\n");
+        tree.write(tree.root / "memory/job/leaf/memory.limit_in_bytes", "max\n");
+        tree.write(tree.root / "memory/job/leaf/memory.usage_in_bytes", "0\n");
+        tree.write(tree.root / "memory/job/memory.limit_in_bytes", "9000\n");
+        tree.write(tree.root / "memory/job/memory.usage_in_bytes", "500\n");
+        check(tree.read().available == 8500, "the v1 parent binds an unlimited leaf");
+    }
     // The real provider still returns bytes or unknown, whichever the host truth is.
     {
         const auto available = conversation_available_memory();

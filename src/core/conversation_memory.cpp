@@ -114,15 +114,26 @@ ConversationCgroupMemory conversation_cgroup_memory(const std::string& proc_cgro
         if (!used) return {true, {}};             // a real limit whose usage cannot be read
         return {true, *limit > *used ? *limit - *used : 0};
     };
-    if (v2_path) {
-        const auto path = cgroup_relative_path(*v2_path);
-        return allowance(root + path + "/memory.max", root + path + "/memory.current");
-    }
-    if (v1_path) {
-        const auto path = cgroup_relative_path(*v1_path);
-        return allowance(root + "/memory" + path + "/memory.limit_in_bytes",
-                         root + "/memory" + path + "/memory.usage_in_bytes");
-    }
+    // Limits are hierarchical: an ancestor's memory.max binds the process even when the
+    // leaf is "max", so walk every level from the leaf to the hierarchy root and keep the
+    // smallest allowance seen.  A missing limit file at a level means that level is unbound.
+    const auto walk = [&](const std::string& base, const std::string& limit_suffix,
+                          const std::string& usage_suffix) -> ConversationCgroupMemory {
+        std::string path = cgroup_relative_path(base);
+        std::optional<uint64_t> bound;            // the smallest level allowance seen
+        while (true) {
+            const auto level = allowance(root + path + limit_suffix, root + path + usage_suffix);
+            if (!level.available) return {true, {}};      // a discovered level that cannot be read
+            if (!bound || *level.available < *bound) bound = level.available;
+            if (path.empty() || path == "/") break;
+            const auto slash = path.rfind('/');
+            path = slash == std::string::npos ? std::string() : path.substr(0, slash);
+        }
+        return {true, bound};
+    };
+    if (v2_path) return walk(*v2_path, "/memory.max", "/memory.current");
+    if (v1_path) return walk("/memory" + cgroup_relative_path(*v1_path),
+                             "/memory.limit_in_bytes", "/memory.usage_in_bytes");
     return {};                                    // no memory controller: the host view alone applies
 }
 

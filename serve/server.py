@@ -5116,6 +5116,9 @@ def make_handler(svc: Service):
                 if isinstance(e, PriorityQueueFull):   # the byte bound at submit time: a machine-readable code
                     err = {"error": {"type": "priority_queue_full", "code": "priority_queue_full",
                                      "message": str(e)}}
+                elif isinstance(e, PriorityUnavailable):
+                    err = {"error": {"type": "priority_unavailable", "code": getattr(e, "code", "priority_unavailable"),
+                                     "message": str(e)}}
                 else:
                     err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
@@ -5223,6 +5226,8 @@ def make_handler(svc: Service):
                 items.close()
             except PriorityQueueFull as e:                   # mid-stream: response.failed with the queue code
                 self._responses_failed(asm, str(e), "priority_queue_full", send)
+            except PriorityUnavailable as e:                 # e.g. priority_resume_refused_persistent
+                self._responses_failed(asm, str(e), getattr(e, "code", "priority_unavailable"), send)
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
@@ -5341,6 +5346,11 @@ def make_handler(svc: Service):
                 events.close()
             except PriorityQueueFull as e:                   # mid-stream: Anthropic's error event, queue code
                 err = {"type": "error", "error": {"type": "api_error", "code": "priority_queue_full", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except PriorityUnavailable as e:                 # e.g. priority_resume_refused_persistent
+                err = {"type": "error", "error": {"type": "api_error", "code": getattr(e, "code", "priority_unavailable"),
+                                                  "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except EngineDied as e:                          # mid-stream: Anthropic's error event
