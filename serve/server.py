@@ -1549,7 +1549,7 @@ class StrataEngine:
 
     def priority_queue_full(self):
         """Pre-header count check for streaming requests in priority mode (finding 5)."""
-        scheduler = self.priority
+        scheduler = getattr(self, 'priority', None)
         return bool(scheduler) and scheduler.queue_full()
 
     def release_priority(self, r):
