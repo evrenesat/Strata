@@ -339,6 +339,15 @@ class PriorityScheduler:
         self.protocol_evidence.append((self.clock(), 'stranded_capsule_retired', r.id, 'pcancel'))
         self._dispatch()
 
+    @staticmethod
+    def _done_fields(r, fields):
+        """The ordinary DONE validation shared by live and retiring terminals: complete
+        field structure, sane counts, finite nonnegative timings."""
+        return (len(fields) < 6 or not fields[1].isdecimal() or not fields[2].isdecimal() or
+                int(fields[1]) > r.max_new or int(fields[2]) != r.prompt_tokens or
+                any(not isinstance(x, str) or x == '' or not math.isfinite(float(x)) or float(x) < 0
+                    for x in fields[3:5]))
+
     def _finish(self, r, line):
         if getattr(r, 'stranded', False) and r.state == 'failed':
             # The retired capsule's terminal (from the stranding PCANCEL): the client
@@ -386,9 +395,7 @@ class PriorityScheduler:
             if not payload.startswith('DONE '):
                 raise PriorityProtocolError('retiring request emitted nonterminal output')
             fields = payload.split()
-            if (len(fields) < 6 or not fields[1].isdecimal() or not fields[2].isdecimal() or
-                    int(fields[1]) > retired.max_new or int(fields[2]) != retired.prompt_tokens or
-                    fields[5] != 'cancel'):
+            if len(fields) != 9 or self._done_fields(retired, fields) or fields[5] != 'cancel':
                 raise PriorityProtocolError('invalid retirement terminal')
             self.retiring.pop(int(parts[1]))
             self.protocol_evidence.append((self.clock(), 'stranded_capsule_terminal', retired.id, 'cancel'))
@@ -482,10 +489,7 @@ class PriorityScheduler:
                     raise PriorityProtocolError('terminal output without owned request')
                 if payload.startswith('DONE '):
                     f=payload.split()
-                    if (len(f)<6 or not f[1].isdecimal() or not f[2].isdecimal() or
-                            int(f[1])>r.max_new or int(f[2])!=r.prompt_tokens or
-                            any(not math.isfinite(float(x)) or float(x)<0 for x in f[3:5]) or
-                            f[5] not in ('stop','length','cancel')):
+                    if (self._done_fields(r, f) or f[5] not in ('stop','length','cancel')):
                         raise PriorityProtocolError('invalid terminal counts')
                 self._finish(r, payload)
                 return

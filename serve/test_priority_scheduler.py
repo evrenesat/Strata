@@ -351,10 +351,13 @@ class SchedulerTests(unittest.TestCase):
         self.s.release(b)                        # the HTTP side may release before the ack
         # a token line for the retiring id is protocol poison before any barrier drop
         before = len(self.sent)
-        self.s.feed('R 1 T 5')
-        self.assertIsNotNone(self.s.dead)                   # nonterminal output: engine fails
-        self.assertIn(1, self.s.retiring)                   # the record was not released
-        self.assertEqual(len(self.sent), before)            # no new dispatch slipped through
+        for poison in ('R 1 T 5', 'R 1 DONE 3 3 NaN NaN cancel', 'R 1 DONE 3 3 0 0 stop 0 0 0',
+                       'R 1 DONE 101 3 0 0 cancel 0 0 0', 'R 1 DONE 3 3 0 0 cancel 0 0'):
+            self.s.feed(poison)
+            self.assertIsNotNone(self.s.dead)               # malformed/wrong terminal: engine fails
+            self.assertIn(1, self.s.retiring)               # the record was not released
+            self.assertEqual(len(self.sent), before)        # no new dispatch slipped through
+            self.s.dead = None                              # each case examined in isolation
 
     def test_backfill_refusals_do_not_arm_the_resume_deadline(self):
         b = self.park(); self.s.admit_backfill(BackfillAdmission('a'*64, True, 1, (1, 1, 1)), 'a'*64)
