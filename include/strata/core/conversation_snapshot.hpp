@@ -66,6 +66,20 @@ struct ConversationKvRestoreResult {
 ConversationKvRestoreResult conversation_kv_restore_source(const QsaState& state, const ModelGeometry& g, int64_t upto,
                                                            bool include_index, const KvDriveFn& drive);
 
+// One layer's destination for a multi-layer restore.  Main layers come first in the vector, the draft entry (if any)
+// last, which is the order a capsule's manifest uses.
+struct ConversationKvTarget {
+    const QsaState* state = nullptr;
+    bool draft = false;
+    int64_t upto = 0;   // this layer's extent: the main prefix for a QSA layer, the speculative extent for the draft
+};
+// Restore every layer of a capsule from ONE verified pass under ONE mutation boundary: all layouts are validated and
+// every destination prepared before the first write, each block goes to its own layer, and the residency finish runs
+// for every layer after the last write.  `invalid` means nothing was written.
+ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive);
+
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -133,6 +147,14 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+// The disk capsule's two halves.  Validation: the same metadata checks, with the image required to carry NO resident
+// K/V (it lives in the capsule file, and the caller proves those layers against the session's targets before any
+// write).  Restore: the running state and checkpoints, with no K/V call at all - the caller restores the K/V from
+// the capsule first, so the layer-by-layer order stays main K/V, main recurrent state, MTP K/V, MTP resident state.
+bool conversation_snapshot_validate_resident(const SavedConversation& image, const SessionState& session,
+                                             const ModelGeometry& g, std::string& error);
+bool conversation_snapshot_restore_resident(const SavedConversation& image, SessionState& session,
+                                            const ModelGeometry& g, std::string& error);
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

@@ -1246,11 +1246,18 @@ bool MtpDrafter::request_validate_layout(const MtpRequestState& image,int64_t pr
 
 bool MtpDrafter::request_restore(const MtpRequestState& image,SessionState& session,std::string& error) {
     if (!request_validate(image,image.prompt_len,image.kv_extent,error)) return false;
+    if (!conversation_kv_restore(image.kv,st_,*g_,image.kv_extent,false,error)) return false;
+    return request_restore_resident(image,session,error);
+}
+
+bool MtpDrafter::request_restore_resident(const MtpRequestState& image,SessionState& session,std::string& error) {
+    // Everything the RAM restore does AFTER the K/V: the disk capsule restores the draft layer's K/V from its file
+    // first (validated with request_validate_layout) and then calls this, so the order stays the same.
     // Allocate diagnostics before any destination write. Every graph still binds
     // the same working addresses; only request data is written back to them.
     auto top2=image.top2; auto debug_logits=image.debug_logits;
     const OnDevice on_device(device_);
-    if (!idle(error) || cudaDeviceSynchronize()!=cudaSuccess) { error="mtp: restore drain failed"; return false; }
+    if (idle(error) || cudaDeviceSynchronize()!=cudaSuccess) { error="mtp: restore drain failed"; return false; }
     auto host=[](auto* p,const auto& v) { if (!v.empty()) std::memcpy(p,v.data(),v.size()*sizeof(*p)); };
     auto device=[&](auto* p,const auto& v) {
         if (!v.empty() && cudaMemcpy(p,v.data(),v.size()*sizeof(*p),cudaMemcpyHostToDevice)!=cudaSuccess) {
@@ -1258,8 +1265,7 @@ bool MtpDrafter::request_restore(const MtpRequestState& image,SessionState& sess
         }
         return true;
     };
-    if (!conversation_kv_restore(image.kv,st_,*g_,image.kv_extent,false,error) ||
-        !device(tok_,image.device_tokens) || !device(step_,image.device_steps) ||
+    if (!device(tok_,image.device_tokens) || !device(step_,image.device_steps) ||
         !device(pos_,image.device_positions) || !device(row_,image.device_row) ||
         !device(out_ids_,image.device_out) || !device(probs_,image.device_prob) ||
         !device(Rin_,image.input_R) || !device(R_,image.residual_R) ||

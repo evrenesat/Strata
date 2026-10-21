@@ -429,6 +429,37 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
 }
 
+namespace {
+// The metadata checks a restore makes before any destination write, with the K/V layer count left to the caller: a
+// RAM image carries one resident entry per layer, a disk image carries none (its K/V is in the capsule file).
+bool snapshot_metadata_valid(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                             std::string& error) {
+    if (!image.live.stage_parts.empty())
+        return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
+    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    // an image holds exactly one carve's running state and K/V: same layer range or nothing
+    if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
+    return view_validate(view, ss, g, error) && conversation_checkpoint_validate(image.live, ss, g, error);
+}
+}  // namespace
+
+bool conversation_snapshot_validate_resident(const SavedConversation& image, const SessionState& ss,
+                                             const ModelGeometry& g, std::string& error) {
+    // A disk capsule holds no K/V payload: this proves the resident manifest only.  The caller proves the capsule's
+    // layers against the session's targets (conversation_kv_restore_source), before the first write, as always.
+    if (!snapshot_metadata_valid(image, ss, g, error)) return false;
+    if (!image.kv.empty()) return fail(error, "a disk capsule image must not carry resident K/V");
+    return true;
+}
+
+bool conversation_snapshot_restore_resident(const SavedConversation& image, SessionState& ss,
+                                            const ModelGeometry& g, std::string& error) {
+    // Exactly what the RAM restore does after its K/V calls: the running state and the checkpoints.
+    return conversation_checkpoint_restore(image.live, ss, g, error);
+}
+
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;

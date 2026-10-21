@@ -75,6 +75,10 @@ public:
     bool request_capture(MtpRequestState&, int64_t extent, std::string& error);
     bool request_validate(const MtpRequestState&, int64_t prompt, int64_t extent, std::string& error) const;
     bool request_restore(const MtpRequestState&, SessionState&, std::string& error);
+    /// The resident half of a restore: every buffer written back and every state field set, with NO K/V call.  The
+    /// disk capsule restores the draft K/V from its file first and then calls this; the RAM overload is exactly its
+    /// K/V restore followed by this.
+    bool request_restore_resident(const MtpRequestState&, SessionState&, std::string& error);
     /// The disk path's capture: the same resident state as request_capture plus the draft layer's K/V as a STREAMED
     /// source, so a capsule can write it without a host copy.  The returned image has no resident K/V payload; its
     /// extent is still the speculative one (lookahead included), and the coupled history/q/R/sampling state is

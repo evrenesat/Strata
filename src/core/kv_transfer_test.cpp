@@ -159,6 +159,35 @@ int main() {
         const auto r = kv_transfer_run(t);
         check(!r.ok && r.outcome == KvTransferOutcome::fatal, "late payload loss is fatal, not a lost capsule");
     }
+    // ---- several layers under one boundary ------------------------------------------------
+    {
+        std::vector<std::pair<size_t,bool>> seen;
+        const KvLayerSink sink=[&](size_t layer,bool draft,size_t part,uint64_t offset,const uint8_t*,size_t n,
+                                   std::string&) {
+            (void)part; (void)offset; (void)n;
+            seen.emplace_back(layer,draft); return true;
+        };
+        const KvLayerDriveFn drive=[](const KvLayerSink& s,std::string& why) {
+            std::vector<uint8_t> data(kBlock,0x11);
+            if (!s(0,false,0,0,data.data(),data.size(),why)) return KvDrive::ok;
+            if (!s(1,false,0,0,data.data(),data.size(),why)) return KvDrive::ok;
+            if (!s(0,true,0,0,data.data(),data.size(),why)) return KvDrive::ok;
+            return KvDrive::ok;
+        };
+        const auto r=kv_layer_transfer_run(drive,sink);
+        check(r.ok && r.verified_bytes==3*kBlock,"several layers are counted together");
+        check(seen.size()==3 && seen[0]==std::make_pair(size_t(0),false) && seen[2]==std::make_pair(size_t(0),true),
+              "the sink sees each layer and the draft entry distinctly");
+        // A failure on a later layer is fatal for the whole capsule, and the earlier layers stay counted.
+        int calls=0;
+        const KvLayerSink refusing=[&](size_t,bool,size_t,uint64_t,const uint8_t*,size_t,std::string& why) {
+            if (++calls==2) { why="layer 1 failed"; return false; }
+            return true;
+        };
+        const auto partial=kv_layer_transfer_run(drive,refusing);
+        check(!partial.ok && partial.outcome==KvTransferOutcome::fatal && partial.verified_bytes==kBlock,
+              "a later layer's failure keeps the whole restore fatal");
+    }
     // ---- degenerate transfers -------------------------------------------------------------
     {
         KvTransfer t;

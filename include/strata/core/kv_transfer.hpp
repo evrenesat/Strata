@@ -54,4 +54,12 @@ struct KvTransfer {
 // call, never after it, so a write that fails halfway is already fatal rather than "recoverable".
 KvTransferResult kv_transfer_run(const KvTransfer& transfer);
 
+// The same rules over SEVERAL layers in one pass: a disk capsule holds every main layer and the draft entry in one
+// file, and the restore must keep one mutation boundary across all of them.  The sink names the layer it belongs to
+// (`draft` distinguishes the MTP entry from the main layers).
+using KvLayerSink = std::function<bool(size_t layer, bool draft, size_t part, uint64_t offset, const uint8_t* data,
+                                      size_t n, std::string& error)>;
+using KvLayerDriveFn = std::function<KvDrive(const KvLayerSink& sink, std::string& error)>;
+KvTransferResult kv_layer_transfer_run(const KvLayerDriveFn& drive, const KvLayerSink& write);
+
 }  // namespace strata::core

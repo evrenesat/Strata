@@ -208,6 +208,60 @@ ConversationKvRestoreResult conversation_kv_restore_source(const QsaState& st, c
     return result;
 }
 
+ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive) {
+    ConversationKvRestoreResult result;
+    if (targets.empty()) { result.error = "conversation snapshot: no K/V layers to restore"; return result; }
+    if (!drive) { result.error = "conversation snapshot: no K/V source"; return result; }
+    // Every layout validated and every destination prepared BEFORE the first write, across all layers: that is what
+    // keeps the capsule's single mutation boundary meaningful.
+    size_t main_layers = 0;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].draft && i + 1 != targets.size()) {
+            result.error = "conversation snapshot: the draft entry must be the last target";
+            return result;
+        }
+        if (!targets[i].draft) ++main_layers;
+    }
+    std::vector<Layout> layouts(targets.size());
+    std::vector<KvBlockSink> writers(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const auto& target = targets[i];
+        if (!target.state) { result.error = "conversation snapshot: missing K/V target state"; return result; }
+        if (!conversation_kv_layout(*target.state, g, target.upto, !target.draft, layouts[i], result.error) ||
+            !conversation_kv_layout_targets(layouts[i], *target.state, target.upto, result.error)) return result;
+        writers[i] = conversation_kv_writer(*target.state, layouts[i], result.error);
+        if (!writers[i]) return result;
+    }
+    const bool has_draft = targets.back().draft;
+    const KvLayerSink sink = [&](size_t layer, bool draft, size_t part, uint64_t offset, const uint8_t* data,
+                                 size_t n, std::string& why) -> bool {
+        if (draft) {
+            if (!has_draft) { why = "conversation snapshot: K/V block for a draft layer this session does not own"; return false; }
+            return writers.back()(part, offset, data, n, why);
+        }
+        if (layer >= main_layers) { why = "conversation snapshot: K/V block for a layer this session does not own"; return false; }
+        return writers[layer](part, offset, data, n, why);
+    };
+    const KvTransferResult ran = kv_layer_transfer_run(drive, sink);
+    result.detail = ran.outcome;
+    result.verified_bytes = ran.verified_bytes;
+    result.error = ran.error;
+    if (!ran.ok) {
+        result.outcome = ran.outcome == KvTransferOutcome::fatal ? ConversationRestore::transfer_failed
+                                                                 : ConversationRestore::invalid;
+        return result;
+    }
+    for (const auto& target : targets)
+        if (!conversation_kv_finish_restore(*target.state, g, target.upto, result.error)) {
+            result.outcome = ConversationRestore::transfer_failed;   // written, but residency did not follow
+            return result;
+        }
+    result.outcome = ConversationRestore::restored;
+    return result;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
