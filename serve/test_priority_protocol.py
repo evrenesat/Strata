@@ -9,9 +9,10 @@ import threading
 import time
 import unittest
 from serve.priority_scheduler import (Role, PriorityScheduler, PriorityUnavailable, PriorityProtocolError,
-                                      PriorityQueueFull)
+                                      PriorityQueueFull, PrioritySpillLost)
 from serve.test_priority_scheduler import Clock
-from serve.server import StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer, EngineDied, Role, serve
+from serve.server import (StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer,
+                          EngineDied, Role, serve, priority_spill_settings, prepare_spill_directory)
 from serve.frontend import ChatTemplate
 
 FAKE_PRIORITY = r'''
@@ -20,7 +21,9 @@ args=sys.argv[1:]
 reply=json.loads(open(args[args.index('--reply')+1]).read())
 log=open(args[args.index('--events')+1],'a')
 priority='--priority-serving' in args
-print('INFO engine=fake priority_protocol=1 priority_backfill=1',flush=True)
+spill='--spill' in args
+spill_lost='--spill-lost' in args
+print('INFO engine=fake priority_protocol=1 priority_backfill=1'+(' priority_spill=1' if spill else ''),flush=True)
 print('READY 262144 stop',flush=True)
 q=queue.Queue()
 def reader():
@@ -47,12 +50,18 @@ while True:
         else:
             print(f"R {active['id']} BLOCK state_transfer 180",flush=True)
             parked,active=active,None
-            print(f"PAUSED {parked['id']} decode {parked['prompt']-1+parked['at']} {parked['at']}",flush=True)
+            print(f"PAUSED {parked['id']} decode {parked['prompt']-1+parked['at']} {parked['at']}"
+                  + (' spill=1' if spill else ''),flush=True)
     elif line.startswith('PRESUME '):
         assert not active and parked and parked['id']==int(line.split()[1])
         print(f"R {parked['id']} BLOCK state_transfer 180",flush=True)
-        active,parked=parked,None
-        print(f"RESUMED {active['id']}",flush=True)
+        if spill and spill_lost:
+            # The capsule is gone: one typed terminal, no RESUMED, no tokens, and the request is dropped.
+            print(f"R {parked['id']} ERR priority_spill_lost",flush=True)
+            parked=None
+        else:
+            active,parked=parked,None
+            print(f"RESUMED {active['id']}",flush=True)
     elif line.startswith('PCANCEL '):
         rid=int(line.split()[1])
         if active and active['id']==rid:terminal(active,'cancel');active=None
@@ -75,11 +84,14 @@ class PipeFixture(unittest.TestCase):
         self.script.write_text('#!'+sys.executable+'\n'+FAKE_PRIORITY)
         self.script.chmod(0o700)
         self.engine=None
-    def start(self, payload=b'background response',priority=True,lazy=False):
+    def start(self, payload=b'background response',priority=True,lazy=False,spill=False,spill_lost=False,
+              spill_config=None):
         self.reply.write_text(json.dumps(list(payload)+[257]))
         args=['--reply',str(self.reply),'--events',str(self.events)]
         if priority:args+=['--priority-serving']
-        self.engine=StrataEngine(str(self.script),args,lazy=lazy)
+        if spill:args+=['--spill']
+        if spill_lost:args+=['--spill-lost']
+        self.engine=StrataEngine(str(self.script),args,lazy=lazy,priority_spill=spill_config)
         return self.engine
     def tearDown(self):
         if self.engine:self.engine.close()
@@ -365,6 +377,44 @@ class StreamingQueueFullTests(PipeFixture):
         self.assertIn('response.failed',body)
         self.assertIn('priority_queue_full',body)
 
+    def start_http_spill(self, spill_lost=True):
+        e = self.start(b'x'*40, lazy=True, spill=True, spill_lost=spill_lost, spill_config=SPILL_ENABLED)
+        svc = Service(e, ByteTokenizer(), ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.shutdown); self.addCleanup(httpd.server_close); self.addCleanup(e.close)
+        return e, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def test_lost_capsule_surfaces_as_a_typed_stream_error_on_all_three_transports(self):
+        cases = (('/v1/chat/completions', {'model': 'm', 'max_tokens': 200, 'stream': True,
+                                          'messages': [{'role': 'user', 'content': 'hello'}]},
+                  '"code": "priority_spill_lost"'),
+                 ('/v1/responses', {'model': 'm', 'stream': True, 'input': 'hello'}, 'response.failed'),
+                 ('/v1/messages', {'model': 'm', 'max_tokens': 200, 'stream': True,
+                                   'messages': [{'role': 'user', 'content': 'hello'}]}, 'event: error'))
+        for path, body, marker in cases:
+            Path(str(self.events)).unlink(missing_ok=True)   # a fresh event log for each transport
+            e, base = self.start_http_spill()
+            requests, errors = [], []
+            def run():
+                try:
+                    requests.append(self.post_stream(base, path, body))
+                except Exception as error:
+                    errors.append(error)
+            t = threading.Thread(target=run); t.start()
+            self.wait(lambda: e.priority is not None and Path(str(self.events)).exists()
+                      and 'PGEN 1' in Path(str(self.events)).read_text())
+            h = e.priority.submit('GEN 20 9,8', Role.HERMES)
+            self.wait(lambda: e.priority.parked == 1 and h.state == 'done')
+            e.priority.release(h)
+            e.priority.lease_until = 0; e.priority.tick()
+            t.join(20); self.assertFalse(t.is_alive(), path)
+            self.assertEqual(errors, [], path)
+            status, text = requests[0]
+            self.assertEqual(status, 200, path)               # headers streamed: a typed in-stream error
+            self.assertIn(marker, text, path)
+            self.assertIn('priority_spill_lost', text, path)
+            self.assertNotIn('RESUMED', Path(str(self.events)).read_text(), path)
+
     def test_configured_zero_silence_means_no_limit(self):
         import math
         e=self.start(priority=True,lazy=True)
@@ -425,3 +475,124 @@ class StreamingQueueFullTests(PipeFixture):
 
 
 if __name__=='__main__':unittest.main()
+
+
+SPILL_ENABLED = {'enabled': True, 'dir': '/nonexistent/spill', 'mode': 'fallback', 'min_free_mib': 4096}
+
+
+class SpillConfigTests(unittest.TestCase):
+    """The spill settings are validated before anything is spawned, and the native flags come from exactly one place."""
+    def test_absent_or_off_settings_enable_nothing(self):
+        self.assertFalse(priority_spill_settings({})['enabled'])
+        self.assertFalse(priority_spill_settings({'priority': {}})['enabled'])
+        self.assertFalse(priority_spill_settings({'priority': {'spill_dir': '/var/spill',
+                                                               'spill_mode': 'off'}})['enabled'])
+    def test_a_directory_defaults_to_fallback(self):
+        settings = priority_spill_settings({'priority': {'spill_dir': '/var/spill'}})
+        self.assertTrue(settings['enabled'])
+        self.assertEqual((settings['mode'], settings['min_free_mib']), ('fallback', 4096))
+    def test_rejected_values(self):
+        for priority in ({'spill_mode': 'sometimes'}, {'spill_mode': True}, {'spill_mode': 'always'},
+                         {'spill_dir': 'relative/path'}, {'spill_dir': ''}, {'spill_dir': 5},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': -1},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': True},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': 1.5},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': 2**63 // 1048576 + 1},
+                         {'spill_min_free_mib': 4096}, {'priority': 'x'}):
+            with self.assertRaises(ValueError, msg=repr(priority)):
+                priority_spill_settings({'priority': priority} if 'priority' not in priority else priority)
+    def test_the_native_flags_are_not_duplicated_through_args(self):
+        with self.assertRaises(ValueError):
+            priority_spill_settings({'priority': {'spill_dir': '/var/spill'},
+                                     'args': ['--priority-spill-dir', '/var/spill']})
+    def test_engine_args_emit_the_flags_once_priority_serves(self):
+        cfg = {'args': ['--pack', 'pack'], 'priority': {'enabled': True, 'spill_dir': '/var/spill',
+                                                        'spill_mode': 'always', 'spill_min_free_mib': 0}}
+        args = engine_args(cfg)
+        self.assertIn('--priority-serving', args)
+        self.assertEqual(args[args.index('--priority-spill-dir') + 1], '/var/spill')
+        self.assertEqual(args[args.index('--priority-spill-mode') + 1], 'always')
+        self.assertEqual(args[args.index('--priority-spill-min-free-mib') + 1], '0')
+    def test_active_spill_requires_priority_serving(self):
+        # A directory with a serving mode, but no priority serving: the flags would mean nothing.
+        with self.assertRaises(ValueError):
+            engine_args({'args': ['--pack', 'pack'], 'priority': {'enabled': False, 'spill_dir': '/var/spill'}})
+    def test_the_directory_is_validated_without_changing_an_existing_one(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as root:
+            good = os.path.join(root, 'spill')
+            os.mkdir(good, 0o700)
+            before = os.lstat(good)
+            prepare_spill_directory(good)                  # accepted, untouched
+            after = os.lstat(good)
+            self.assertEqual((before.st_mode, before.st_uid), (after.st_mode, after.st_uid))
+            # Only the final missing component may be created, and with mode 0700.
+            missing = os.path.join(root, 'created')
+            prepare_spill_directory(missing)
+            self.assertEqual(stat.S_IMODE(os.lstat(missing).st_mode), 0o700)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(os.path.join(root, 'absent-parent', 'spill'))
+            loose = os.path.join(root, 'loose')
+            os.mkdir(loose, 0o755)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(loose)
+            link = os.path.join(root, 'link')
+            os.symlink(good, link)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(link)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory('relative/spill')
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(root + '/../spill')
+            plain = os.path.join(root, 'plain')
+            open(plain, 'w').close()
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(plain)
+
+
+class SpillProtocolTests(PipeFixture):
+    """End to end through the real pipe reader: capability, the parked location, and the typed loss."""
+    def test_capable_engine_marks_the_park_on_disk(self):
+        e = self.start(b'x'*40, spill=True, spill_config=SPILL_ENABLED); out = []
+        t = threading.Thread(target=lambda: out.extend(e.generate([1,2,3], 200, {'seed': 424242}, threading.Event())))
+        t.start(); self.wait(lambda: len(out) > 2)
+        h = e.priority.submit('GEN 20 4,5', Role.HERMES)
+        self.wait(lambda: e.priority.parked == 1)
+        self.assertTrue(e.priority.snapshot()['parked_on_disk'])
+        self.assertTrue(any(entry[1] == 'parked_on_disk' for entry in e.priority.protocol_evidence))
+        svc = Service(e, ByteTokenizer(), ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        self.assertTrue(svc.metrics()['priority']['parked_on_disk'])
+        self.wait(lambda: h.state == 'done'); e.priority.release(h)
+        e.priority.lease_until = 0; e.priority.tick(); t.join(4)
+        self.assertFalse(t.is_alive())
+        self.assertFalse(e.priority.snapshot()['parked_on_disk'])
+
+    def test_a_spill_enabled_server_refuses_an_engine_without_the_capability(self):
+        with self.assertRaises(ValueError):
+            self.start(b'x', spill_config=SPILL_ENABLED)     # the fake does not advertise priority_spill
+        self.assertIsNone(self.engine)                       # the refused start left no engine behind
+
+    def test_a_lost_capsule_ends_the_parked_stream_with_one_typed_error(self):
+        e = self.start(b'x'*40, spill=True, spill_lost=True, spill_config=SPILL_ENABLED)
+        out, errors = [], []
+        def run():
+            try: out.extend(e.generate([1,2,3], 200, {}, threading.Event()))
+            except Exception as error: errors.append(error)
+        t = threading.Thread(target=run); t.start()
+        self.wait(lambda: len(out) > 2)
+        h = e.priority.submit('GEN 20 4,5', Role.HERMES)
+        self.wait(lambda: e.priority.parked == 1 and e.priority.snapshot()['parked_on_disk'])
+        self.wait(lambda: h.state == 'done'); e.priority.release(h)
+        before = list(out)
+        e.priority.lease_until = 0; e.priority.tick(); t.join(4)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], PrioritySpillLost)
+        self.assertEqual(errors[0].code, 'priority_spill_lost')
+        self.assertEqual(out, before)                       # no token after the loss, no replay
+        self.assertFalse(any(line.startswith('RESUMED') for line in self.events.read_text().splitlines()))
+        self.assertFalse(any(line.startswith('PCANCEL') for line in self.events.read_text().splitlines()))
+        self.assertIsNone(e.priority.parked)
+        self.assertFalse(e.priority.snapshot()['parked_on_disk'])
+        # The engine is healthy: the next request runs normally.
+        self.assertEqual(list(e.generate([7], 200, {}, threading.Event()))[-1], 257)

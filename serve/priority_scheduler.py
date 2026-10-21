@@ -32,6 +32,12 @@ class PriorityResumeRefusedPersistent(PriorityUnavailable):
     code = 'priority_resume_refused_persistent'
 
 
+class PrioritySpillLost(PriorityUnavailable):
+    """The engine lost a parked request's spilled K/V before restoring any live state: its HTTP
+    stream is closed with this code and nothing is retried or cancelled on its behalf."""
+    code = 'priority_spill_lost'
+
+
 class PriorityProtocolError(RuntimeError):
     pass
 
@@ -64,6 +70,7 @@ class Request:
     cancel_sent: bool = False
     started: bool = False
     backfill: bool = False
+    spilled: bool = False       # parked with its K/V on disk (PAUSED ... spill=1)
     max_new: int = 0
     prompt_tokens: int = 0
     admitted: threading.Event = field(default_factory=threading.Event)
@@ -356,6 +363,7 @@ class PriorityScheduler:
             return
         if r.state in ('done', 'failed'):
             raise PriorityProtocolError('duplicate priority terminal event')
+        r.spilled = False
         r.state = 'done'
         r.terminal = line
         r.admitted.set()
@@ -415,18 +423,26 @@ class PriorityScheduler:
             if self.active != r.id or r.state not in ('pausing', 'cancelling') or self.parked is not None:
                 raise PriorityProtocolError('unexpected pause acknowledgement')
             fields = parts[2].split()
-            if (len(fields) not in (3,4) or fields[0] not in ('prefill','decode') or
+            if (len(fields) < 3 or len(fields) > 5 or fields[0] not in ('prefill','decode') or
                     not all(x.isdecimal() for x in fields[1:3])):
                 raise PriorityProtocolError('bad pause boundary')
+            # Optional capability tokens after the mandatory three fields: backfill=0 and spill=1, each at most once,
+            # in either order.  Duplicates, conflicts and unknown tokens are protocol errors, not ignored.
+            options = fields[3:]
+            if (len(set(options)) != len(options) or
+                    any(o not in ('backfill=0', 'spill=1') for o in options)):
+                raise PriorityProtocolError('bad pause capability')
             position, produced = map(int, fields[1:3])
             if (produced>=r.max_new or
                     (fields[0]=='prefill' and (produced or not 0<position<r.prompt_tokens)) or
                     (fields[0]=='decode' and position!=r.prompt_tokens-1+produced)):
                 raise PriorityProtocolError('pause boundary budget/position mismatch')
-            if len(fields) == 4:
-                if fields[3] != 'backfill=0':
-                    raise PriorityProtocolError('bad pause capability')
+            if 'backfill=0' in options:
                 self.backfill_disabled_until = self.lease_until
+            r.spilled = 'spill=1' in options
+            if r.spilled:
+                # One event per disk park: where the parked capsule actually lives, never a payload or path.
+                self.protocol_evidence.append((self.clock(), 'parked_on_disk', r.id, 'spill'))
             r.state = 'cancelling' if r.cancel_sent else 'parked'
             r.control = None
             self.parked, self.active = r.id, None
@@ -436,6 +452,7 @@ class PriorityScheduler:
             if self.active != r.id or r.state not in ('resuming', 'cancelling'):
                 raise PriorityProtocolError('unexpected resume acknowledgement')
             self.parked = None
+            r.spilled = False       # RESUMED: its K/V is resident again
             r.state = 'cancelling' if r.cancel_sent else 'running'
             r.control = None
             r.heard, r.allowance = self.clock(), self.silence
@@ -609,5 +626,7 @@ class PriorityScheduler:
 
     def snapshot(self):
         with self.lock:
+            parked = self.requests.get(self.parked) if self.parked is not None else None
             return dict(active=self.active, parked=self.parked, lease_until=self.lease_until,
-                        backfill=self.backfill, requests={i:r.state for i,r in self.requests.items()})
+                        backfill=self.backfill, parked_on_disk=bool(parked and parked.spilled),
+                        requests={i:r.state for i,r in self.requests.items()})
