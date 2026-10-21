@@ -1140,12 +1140,13 @@ bool MtpDrafter::request_bytes(int64_t extent,size_t& bytes,std::string& error) 
     return true;
 }
 
-bool MtpDrafter::request_capture(MtpRequestState& out,int64_t extent,std::string& error) {
+// The resident half of a request capture: every buffer readback plus the identity fields, with no K/V.  Both the RAM
+// capture and the disk capture (which streams the K/V separately) start from this, so they cannot drift.
+bool MtpDrafter::request_resident_capture(MtpRequestState& image,int64_t extent,std::string& error) {
     size_t estimate=0;
     if (!request_bytes(extent,estimate,error)) return false;
     const OnDevice on_device(device_);
     if (!idle(error) || cudaDeviceSynchronize()!=cudaSuccess) { error="mtp: capture drain failed"; return false; }
-    MtpRequestState image;
     image.geometry=request_geometry(); image.prompt_len=prompt_len_; image.kv_extent=extent;
     image.max_drafts=max_drafts_; image.coupled=coupled_active_;
     image.ms_draft=ms_draft; image.ms_prefill=ms_prefill; image.rounds=rounds;
@@ -1178,8 +1179,29 @@ bool MtpDrafter::request_capture(MtpRequestState& out,int64_t extent,std::string
     }
     if (h_q_) host(image.q,h_q_,T*kSpecQStride);
     image.top2=top2_; image.debug_logits=lg_host_;
+    return true;
+}
+
+bool MtpDrafter::request_capture(MtpRequestState& out,int64_t extent,std::string& error) {
+    MtpRequestState image;
+    if (!request_resident_capture(image,extent,error)) return false;
     if (!conversation_kv_save(image.kv,st_,*g_,extent,false,error) ||
         !request_validate(image,prompt_len_,extent,error)) return false;
+    out=std::move(image);
+    return true;
+}
+
+bool MtpDrafter::request_capture_sources(MtpRequestState& out,SessionKvSource& kv,int64_t extent,
+        std::string& error) {
+    MtpRequestState image;
+    if (!request_resident_capture(image,extent,error)) return false;
+    SessionKvSource source;
+    if (!conversation_kv_source(source,st_,*g_,extent,false,error)) return false;
+    // The K/V is the caller's now: this image must not carry (or claim) a resident copy, but its resident manifest
+    // still has to be exactly what a restore will check.
+    image.kv=ConversationKv{};
+    if (!image.validate_layout(request_geometry(),image.prompt_len,extent,error)) return false;
+    kv=std::move(source);
     out=std::move(image);
     return true;
 }
@@ -1188,12 +1210,38 @@ bool MtpDrafter::request_validate(const MtpRequestState& image,int64_t prompt,in
         std::string& error) const {
     size_t ignored=0;
     if (!request_bytes(extent,ignored,error) || !image.validate_layout(request_geometry(),prompt,extent,error)) return false;
+    if (!request_buffers_present(error)) return false;
+    return conversation_kv_validate(image.kv,st_,*g_,extent,false,error);
+}
+
+bool MtpDrafter::request_buffers_present(std::string& error) const {
     if (!h_tok_ || !h_step_ || !h_pos_ || !h_row_ || !h_out_ || !h_prob_ ||
         !tok_ || !step_ || !pos_ || !row_ || !out_ids_ || !probs_ || !Rin_ || !R_ ||
         (h_cparams_ && (!cparams_ || !h_chist_ || !cring_))) {
-        error="mtp: request restore buffer missing"; return false;
+        error="mtp: request restore buffer missing";
+        return false;
     }
-    return conversation_kv_validate(image.kv,st_,*g_,extent,false,error);
+    return true;
+}
+
+bool MtpDrafter::request_validate_layout(const MtpRequestState& image,int64_t prompt,int64_t extent,
+        const ConversationKvLayout& layout,std::string& error) const {
+    size_t ignored=0;
+    if (!request_bytes(extent,ignored,error) || !image.validate_layout(request_geometry(),prompt,extent,error)) return false;
+    if (!request_buffers_present(error)) return false;
+    // The K/V is on the caller's side, so it is checked as a layout: the state must be able to hold it, and the layout
+    // must be the one this geometry and extent imply.
+    ConversationKvLayout expected;
+    if (!conversation_kv_layout(st_,*g_,extent,false,expected,error)) return false;
+    if (layout.format!=expected.format || layout.cells!=expected.cells ||
+        layout.pooled_rows!=expected.pooled_rows || layout.page_size!=expected.page_size ||
+        layout.data!=expected.data || layout.value_data!=expected.value_data ||
+        layout.scales!=expected.scales || layout.value_scales!=expected.value_scales ||
+        layout.pooled!=expected.pooled) {
+        error="mtp: request K/V layout mismatch";
+        return false;
+    }
+    return conversation_kv_layout_targets(layout,st_,extent,error);
 }
 
 bool MtpDrafter::request_restore(const MtpRequestState& image,SessionState& session,std::string& error) {

@@ -20,6 +20,8 @@
 #pragma once
 
 #include "strata/core/layer.hpp"
+#include "strata/core/conversation_file.hpp"   // SessionKvSource
+#include "strata/core/conversation_kv_layout.hpp"   // the disk path's K/V layout
 #include "strata/core/session.hpp"
 #include "strata/core/mtp_request.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -73,6 +75,20 @@ public:
     bool request_capture(MtpRequestState&, int64_t extent, std::string& error);
     bool request_validate(const MtpRequestState&, int64_t prompt, int64_t extent, std::string& error) const;
     bool request_restore(const MtpRequestState&, SessionState&, std::string& error);
+    /// The disk path's capture: the same resident state as request_capture plus the draft layer's K/V as a STREAMED
+    /// source, so a capsule can write it without a host copy.  The returned image has no resident K/V payload; its
+    /// extent is still the speculative one (lookahead included), and the coupled history/q/R/sampling state is
+    /// captured exactly as before.
+    bool request_capture_sources(MtpRequestState&, SessionKvSource&, int64_t extent, std::string& error);
+    /// Disk-aware validation: the resident manifest and this drafter's buffers, with the K/V checked as a LAYOUT
+    /// (geometry, extent and target capability) rather than as a resident buffer.  The RAM overload above still
+    /// requires the payload.
+    bool request_validate_layout(const MtpRequestState&, int64_t prompt, int64_t extent,
+                                 const ConversationKvLayout& layout, std::string& error) const;
+    /// True when every buffer a request restore writes into is still allocated.
+    bool request_buffers_present(std::string& error) const;
+    /// The resident half of a capture (all readbacks, no K/V); public so the disk capture can share it.
+    bool request_resident_capture(MtpRequestState&, int64_t extent, std::string& error);
     bool request_verify(const MtpRequestState&,uint64_t& fingerprint,std::string& error,
                         bool restored_residency = true) const;
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
