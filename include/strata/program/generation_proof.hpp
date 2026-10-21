@@ -43,6 +43,13 @@ inline bool proof_command(const std::string& line,ProofCommand& out) {
         else if(arg=="capture_postcheck") c.injection=ProofFault::capture_postcheck;
         else if(arg=="restore_validation") c.injection=ProofFault::restore_validation;
         else if(arg=="restore_after_main") c.injection=ProofFault::restore_after_main;
+        // The parked-capsule disk faults: the same trusted, default-off grammar (never an HTTP parameter).
+        else if(arg=="spill_ram_admission") c.injection=ProofFault::spill_ram_admission;
+        else if(arg=="spill_write") c.injection=ProofFault::spill_write;
+        else if(arg=="spill_truncate") c.injection=ProofFault::spill_truncate;
+        else if(arg=="spill_corrupt_first") c.injection=ProofFault::spill_corrupt_first;
+        else if(arg=="spill_corrupt_late") c.injection=ProofFault::spill_corrupt_late;
+        else if(arg=="spill_source_copy") c.injection=ProofFault::spill_source_copy;
         else return false;
     } else if(verb=="PAUSE") {
         c.kind=ProofCommand::pause;
