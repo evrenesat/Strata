@@ -34,6 +34,10 @@ constexpr int kOpenDirectory = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
 
 std::atomic<uint64_t> g_spill_write_bytes{0};
 
+// The largest file offset a capsule may address.  Signed 64-bit is what every supported platform's pread/pwrite takes,
+// and naming it here keeps `off_t` (which Windows does not define) out of the host-only code paths.
+constexpr uint64_t kSpillMaxFileOffset = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+
 uint64_t page_bytes() {
 #if defined(__linux__)
     const long page = ::sysconf(_SC_PAGESIZE);
@@ -211,7 +215,7 @@ bool spill_manifest_layout(SpillManifest& manifest, std::string& error) {
     const auto account = [&](const SpillLayer& layer) {
         for (size_t part = 0; part < kSpillParts; ++part) {
             if (!add_checked(total, layer.sizes[part]) ||
-                total > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+                total > static_cast<uint64_t>(kSpillMaxFileOffset)) {
                 error = "spill payload is too large for this platform";
                 return false;
             }
@@ -243,7 +247,7 @@ bool spill_manifest_layout(SpillManifest& manifest, std::string& error) {
                 error = "spill payload size overflows";
                 return false;
             }
-            if (offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+            if (offset > static_cast<uint64_t>(kSpillMaxFileOffset)) {
                 error = "spill payload is too large for this platform";
                 return false;
             }
@@ -307,7 +311,7 @@ bool spill_manifest_check(const SpillManifest& manifest, std::string& error) {
         error = "manifest payload size does not match its extents";
         return false;
     }
-    if (expected > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    if (expected > static_cast<uint64_t>(kSpillMaxFileOffset)) {
         error = "manifest payload exceeds this platform's file offsets";
         return false;
     }
