@@ -411,7 +411,17 @@ GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver
 GenerationTransfer generation_capture(GenerationCapsule& out,GenerationDriver& driver,
         std::vector<core::ConversationCheckpoint>& checks,GenerationRuntime& runtime,std::string& error) {
     const bool spill_available=runtime.spill_dir && runtime.spill_dir->valid();
-    if (spill_available && runtime.spill_always) return capture_spill(out,driver,checks,runtime,error);
+    if (spill_available) {
+        // The trusted fault refuses only the RAM CANDIDATE, so the disk attempt below is the real fallback logic
+        // (validation included) rather than a second, test-only path through it.
+        const bool forced_ram_refusal=runtime.proof &&
+            runtime.proof->take(ProofFault::spill_ram_admission,driver.request_id);
+        if (runtime.spill_always || forced_ram_refusal) {
+            if (!out.occupied && driver.validate(error) && runtime_valid(driver,runtime,error) &&
+                checkpoints_valid(checks,driver,runtime,error))
+                return capture_spill(out,driver,checks,runtime,error);
+        }
+    }
     bool capacity_refused=false;
     const auto result=capture_ram(out,driver,checks,runtime,error,capacity_refused);
     // `fallback`: one disk attempt after a capacity refusal, and never for any other kind of refusal.  A forced RAM
