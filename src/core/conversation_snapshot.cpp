@@ -129,6 +129,10 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    return conversation_kv_finish_restore(st, g, upto, error);
+}
+
+bool conversation_kv_finish_restore(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
@@ -143,6 +147,65 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
     return false;
+}
+
+bool conversation_kv_visit(const ConversationKv& image, const KvBlockSink& sink, std::string& error) {
+    if (!sink) { error = "conversation snapshot: no K/V sink"; return false; }
+    const std::array<const ConversationBuffer*,5> buffers = {&image.k,&image.v,&image.k_scale,&image.v_scale,
+                                                             &image.pooled};
+    for (size_t part = 0; part < buffers.size(); ++part) {
+        if (buffers[part]->empty()) continue;
+        if (!buffers[part]->visit(0, buffers[part]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return sink(part, at, p, n, error);
+            })) return false;
+    }
+    return true;
+}
+
+KvBlockSink conversation_kv_writer(const QsaState& st, const ConversationKvLayout& layout, std::string& error) {
+    const auto sizes = layout.part_sizes();
+    const auto destinations = pools(st);
+    for (size_t part = 0; part < sizes.size(); ++part)
+        if (sizes[part] && !destinations[part]) {
+            error = "conversation snapshot: missing target state buffer";
+            return {};
+        }
+    return [sizes, destinations](size_t part, uint64_t offset, const uint8_t* data, size_t n,
+                                 std::string& why) -> bool {
+        if (part >= sizes.size() || offset > sizes[part] || n > sizes[part] - offset) {
+            why = "conversation snapshot: K/V block out of range";
+            return false;
+        }
+        return transfer(static_cast<uint8_t*>(destinations[part]) + offset, data, n, why);
+    };
+}
+
+ConversationKvRestoreResult conversation_kv_restore_source(const QsaState& st, const ModelGeometry& g, int64_t upto,
+                                                           bool include_index, const KvDriveFn& drive) {
+    ConversationKvRestoreResult result;
+    Layout l{};
+    if (!conversation_kv_layout(st, g, upto, include_index, l, result.error) ||
+        !conversation_kv_layout_targets(l, st, upto, result.error)) return result;   // invalid: nothing written
+    KvBlockSink writer = conversation_kv_writer(st, l, result.error);
+    if (!writer) return result;
+    KvTransfer transfer;
+    transfer.drive = drive;
+    transfer.write = writer;
+    const KvTransferResult ran = kv_transfer_run(transfer);
+    result.detail = ran.outcome;
+    result.verified_bytes = ran.verified_bytes;
+    result.error = ran.error;
+    if (!ran.ok) {
+        result.outcome = ran.outcome == KvTransferOutcome::fatal ? ConversationRestore::transfer_failed
+                                                                 : ConversationRestore::invalid;
+        return result;
+    }
+    if (!conversation_kv_finish_restore(st, g, upto, result.error)) {
+        result.outcome = ConversationRestore::transfer_failed;   // the pools are written; residency did not follow
+        return result;
+    }
+    result.outcome = ConversationRestore::restored;
+    return result;
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,

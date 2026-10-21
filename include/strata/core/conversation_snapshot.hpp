@@ -2,6 +2,7 @@
 
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_kv_layout.hpp"
+#include "strata/core/kv_transfer.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -36,6 +37,35 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, std::string& error);
+// How a restore ended: `invalid` is a refusal before any write, `transfer_failed` may already have written part
+// of the destination, and the caller must not continue inference from such a session.
+enum class ConversationRestore { restored, invalid, transfer_failed };
+
+// --- the disk path's halves: visit a payload as verified blocks, write one into the live pools ----
+// Pushes a RAM image's own segmented buffers as complete blocks, in part order, with no staging copy.  A verified
+// spill read pushes its blocks through the same sink instead.
+bool conversation_kv_visit(const ConversationKv& image, const KvBlockSink& sink, std::string& error);
+// The live destination for a restore: one verified block is copied into the authoritative pool for its part, bounds
+// checked against the layout.  The caller synchronizes the device before and after, exactly as the RAM restore
+// requires.  An empty function (with `error` set) means the state cannot be a destination.
+KvBlockSink conversation_kv_writer(const QsaState& state, const ConversationKvLayout& layout, std::string& error);
+// After every part was written: invalidate the streaming map and refill the resident ring from the restored
+// authoritative pools, exactly as the RAM restore does.
+bool conversation_kv_finish_restore(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
+
+// What a transfer restore ended as, in both vocabularies: the RAM-shaped outcome for existing callers and the
+// transaction detail (refused / lost / fatal) that decides between a typed loss and a poisoned engine.
+struct ConversationKvRestoreResult {
+    ConversationRestore outcome = ConversationRestore::invalid;
+    KvTransferOutcome detail = KvTransferOutcome::refused;
+    uint64_t verified_bytes = 0;
+    std::string error;
+};
+// Restore any K/V source through the shared transaction rules: verify, then write, then count, under one mutation
+// boundary, followed by the residency finish.  `invalid` means nothing was written.
+ConversationKvRestoreResult conversation_kv_restore_source(const QsaState& state, const ModelGeometry& g, int64_t upto,
+                                                           bool include_index, const KvDriveFn& drive);
+
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -95,9 +125,14 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+// The same without the draft layer's K/V (`draft == nullptr`): `sources` holds the session's own QSA layers only,
+// matching a snapshot validated and restored with the nullable-draft calls below.  A layer split's later stages park
+// this way.
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
-enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
