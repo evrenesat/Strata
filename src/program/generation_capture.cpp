@@ -255,8 +255,10 @@ bool spill_stream_parts(const core::SessionKvSource& src,core::SpillWriter& writ
 
 // The disk capture.  One attempt only: this never retries after a storage fault, and it is reached either because the
 // RAM attempt was refused for capacity or because `spill_always` skipped it.
+enum class SpillReason : uint64_t { always=1, forced=2, capacity=3 };
 GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver,
-        std::vector<core::ConversationCheckpoint>& checks,GenerationRuntime& runtime,std::string& error) {
+        std::vector<core::ConversationCheckpoint>& checks,GenerationRuntime& runtime,SpillReason reason,
+        std::string& error) {
     if (!runtime.spill_dir || !runtime.spill_dir->valid()) {
         error="spill capture has no validated directory"; return GenerationTransfer::refused;
     }
@@ -385,6 +387,9 @@ GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver
         const auto accounting=runtime.accounting();
         const auto parked_at=std::chrono::steady_clock::now();
         core::SpillManifest published=spill.manifest;
+        // The numbers this decision used, for bounded proof: why the disk path ran, what the host had, what the
+        // capture asked for and retained, and how much space the capsule needed free.
+        const auto host_available=core::conversation_available_memory();
         if (!generation_publish(out,driver,checks,std::move(meta),std::move(mtp_state),actual,
                 core::conversation_available_memory(),error,std::move(spill))) {
             return GenerationTransfer::refused;   // a broken capsule is refused with the background still running
@@ -400,6 +405,9 @@ GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver
             runtime.proof->emit("spill_capture",fault_id,payload,written,rate_before.have() ? uint64_t(rate_before.bytes_per_second()) : 0);
             runtime.proof->emit("spill_manifest",fault_id,published.main.size(),
                 published.draft ? 1u : 0u,uint64_t(seconds*1000));
+            runtime.proof->emit("spill_admission",fault_id,uint64_t(reason),
+                host_available ? *host_available : 0,additional);
+            runtime.proof->emit("spill_bytes",fault_id,payload,written,retained);
         }
         return GenerationTransfer::complete;
     } catch (const std::bad_alloc&) {
@@ -419,7 +427,8 @@ GenerationTransfer generation_capture(GenerationCapsule& out,GenerationDriver& d
         if (runtime.spill_always || forced_ram_refusal) {
             if (!out.occupied && driver.validate(error) && runtime_valid(driver,runtime,error) &&
                 checkpoints_valid(checks,driver,runtime,error))
-                return capture_spill(out,driver,checks,runtime,error);
+                return capture_spill(out,driver,checks,runtime,
+                    runtime.spill_always ? SpillReason::always : SpillReason::forced,error);
         }
     }
     bool capacity_refused=false;
@@ -427,7 +436,7 @@ GenerationTransfer generation_capture(GenerationCapsule& out,GenerationDriver& d
     // `fallback`: one disk attempt after a capacity refusal, and never for any other kind of refusal.  A forced RAM
     // refusal (the trusted proof fault) is the way this branch is exercised on real hardware.
     if (result==GenerationTransfer::refused && capacity_refused && spill_available)
-        return capture_spill(out,driver,checks,runtime,error);
+        return capture_spill(out,driver,checks,runtime,SpillReason::capacity,error);
     return result;
 }
 
