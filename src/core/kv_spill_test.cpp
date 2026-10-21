@@ -546,6 +546,20 @@ int main() {
             check(!result.ok && result.error == "sink refused" && result.verified_bytes == 0,
                   "a sink refusal stops before any block is counted as verified");
         }
+        // A refused open still owns the descriptor: the capsule survives for a retry or a cancellation.
+        {
+            SpillManifest manifest = make_manifest(28, {{kSpillBlockBytes, 0, 0, 0, 0}});
+            SpillWriter writer;
+            write_capsule(manifest, writer);
+            SpillFile file = writer.release();
+            check(::ftruncate(file.fd(), 0) == 0, "the capsule is emptied");
+            SpillReader reader = SpillReader::open(std::move(file), manifest, error);
+            check(!reader.valid(), "an emptied capsule does not open");
+            SpillFile back = reader.release_file();
+            check(back.valid(), "the refused open hands the descriptor back");
+            const auto result = reader.run({});
+            check(!result.ok && result.admission, "a reader that never opened refuses as an admission, not a loss");
+        }
         // A truncated capsule is refused before the read starts.
         {
             SpillManifest manifest = make_manifest(25, {{kSpillBlockBytes * 2, 0, 0, 0, 0}});

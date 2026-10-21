@@ -431,6 +431,70 @@ GenerationTransfer generation_capture(GenerationCapsule& out,GenerationDriver& d
     return result;
 }
 
+namespace {
+// The draft entry's layout, for the disk-aware validation: the same geometry the capture wrote.
+bool spill_draft_layout(const GenerationRuntime& r,const GenerationDriver& d,core::ConversationKvLayout& layout,
+                        std::string& error) {
+    return core::conversation_kv_layout(r.mtp->kv_state(),r.geometry,draft_extent(d,r),false,layout,error);
+}
+// Restore a disk capsule's K/V and resident state in the plan's order: every main layer's K/V, then the main layers'
+// recurrent state, then the draft layer's K/V and its working state.  Returns `lost` when the payload proved unusable
+// before anything was written, `refused` for an admission refusal (the capsule keeps its file), `transfer_failed`
+// once any live write happened.
+GenerationTransfer restore_spill_kv(GenerationCapsule& image,GenerationRuntime& runtime,std::string& error) {
+    if (!image.spill) { error="generation capsule has no spill to restore"; return GenerationTransfer::refused; }
+    std::optional<CapsuleSpill> spill=image.release_spill();
+    core::SpillReader reader=core::SpillReader::open(std::move(spill->file),spill->manifest,error);
+    if (!reader.valid()) {
+        // Validation refused it (or the file is not what the manifest describes): give the capsule its file back so a
+        // retry or a cancellation can still close it, exactly as the RAM refusal path allows.
+        spill->file=reader.release_file();
+        image.spill=std::move(spill);
+        return GenerationTransfer::refused;
+    }
+    spill.reset();   // the reader owns the descriptor from here on
+    std::vector<core::ConversationKvTarget> targets;
+    for (const auto* state:spill_layer_states(runtime))
+        targets.push_back({state,false,image.driver.position});
+    const bool has_draft=runtime.mtp!=nullptr;
+    if (has_draft) targets.push_back({&runtime.mtp->kv_state(),true,draft_extent(image.driver,runtime)});
+    bool main_restored=false;
+    const auto restore_main_resident=[&](std::string& why) {
+        if (!core::conversation_snapshot_restore_resident(image.main,runtime.session,runtime.geometry,why))
+            return false;
+        main_restored=true;
+        // The existing proof fault keeps firing on this path too: an injected failure after the main transfer.
+        if (runtime.proof && runtime.proof->take(ProofFault::restore_after_main,image.driver.request_id)) {
+            why="native proof: injected failure after main transfer";
+            return false;
+        }
+        return true;
+    };
+    // One verified pass over the capsule; the reader has already checked every block against its digest.
+    const core::KvLayerDriveFn drive=[&](const core::KvLayerSink& sink,std::string& why) -> core::KvDrive {
+        const core::SpillReadResult read=reader.run([&](const core::SpillBlockRef& block,std::string& why_block) {
+            return sink(block.layer,block.draft,block.part,block.offset,block.data,block.size,why_block);
+        });
+        if (read.ok) return core::KvDrive::ok;
+        why=read.error;
+        return read.admission ? core::KvDrive::refused : core::KvDrive::lost;
+    };
+    const auto restored=core::conversation_kv_restore_layers(runtime.geometry,targets,drive,
+        has_draft ? restore_main_resident : std::function<bool(std::string&)>{});
+    if (restored.outcome!=core::ConversationRestore::restored) {
+        error=restored.error;
+        if (restored.detail==core::KvTransferOutcome::fatal) return fatal(runtime,error);
+        return restored.detail==core::KvTransferOutcome::lost ? GenerationTransfer::lost : GenerationTransfer::refused;
+    }
+    if (!has_draft && !restore_main_resident(error)) return fatal(runtime,error);
+    // Main K/V and recurrent state are in place; now the draft layer's working state (its K/V came last in the pass).
+    if (has_draft && !runtime.mtp->request_restore_resident(*image.mtp,runtime.session,error))
+        return fatal(runtime,error);
+    if (!main_restored) { error="generation capsule main state was not restored"; return fatal(runtime,error); }
+    return GenerationTransfer::complete;
+}
+}  // namespace
+
 GenerationTransfer generation_restore(GenerationCapsule& image,GenerationDriver& driver,
         std::vector<core::ConversationCheckpoint>& checks,GenerationRuntime& runtime,std::string& error) {
     // Trusted proof metadata only: categories distinguish prevalidation,
@@ -456,16 +520,30 @@ GenerationTransfer generation_restore(GenerationCapsule& image,GenerationDriver&
             return fatal(runtime,error);
         image.driver.version=original_version+1;
     }
+    // A disk capsule validates its resident manifest and its K/V as LAYOUTS (the payload is in its file); the RAM path
+    // keeps validating the payload itself.  Both run before any destination write.
+    const bool disk_capsule=image.spill.has_value();
+    core::ConversationKvLayout draft_layout;
+    const auto state_valid=[&]() -> bool {
+        if (disk_capsule)
+            return core::conversation_snapshot_validate_resident(image.main,runtime.session,runtime.geometry,error);
+        return core::conversation_snapshot_validate(image.main,runtime.session,runtime.geometry,
+            static_cast<const core::QsaState*>(nullptr),error);
+    };
+    const auto mtp_valid=[&]() -> bool {
+        if (!runtime.mtp) return true;
+        const int64_t extent=draft_extent(image.driver,runtime);
+        if (!disk_capsule) return runtime.mtp->request_validate(*image.mtp,image.driver.original_prompt_len,extent,error);
+        return core::conversation_kv_layout(runtime.mtp->kv_state(),runtime.geometry,extent,false,draft_layout,error) &&
+               runtime.mtp->request_validate_layout(*image.mtp,image.driver.original_prompt_len,extent,draft_layout,error);
+    };
     if (!image.occupied || image.version!=GenerationCapsule::schema_version ||
         image.saved_phase!=image.driver.phase || !image.driver.validate(error) ||
         !runtime_valid(image.driver,runtime,error,true) || !checks.empty() ||
         (driver.phase!=GenerationPhase::parked && driver.phase!=GenerationPhase::terminal) ||
         image.main.live.ids!=image.driver.consumed || !prefix_images_equal(image.main.live.imgs,image.driver) ||
         image.main.cvec!=image.driver.cvec || image.mtp.has_value()!=(runtime.mtp!=nullptr) ||
-        !core::conversation_snapshot_validate(image.main,runtime.session,runtime.geometry,
-            static_cast<const core::QsaState*>(nullptr),error) ||
-        (runtime.mtp && !runtime.mtp->request_validate(*image.mtp,image.driver.original_prompt_len,
-            draft_extent(image.driver,runtime),error))) {
+        !state_valid() || !mtp_valid()) {
         if(injected_validation) {
             image.driver.version=original_version;
             uint64_t after=0;
@@ -507,17 +585,24 @@ GenerationTransfer generation_restore(GenerationCapsule& image,GenerationDriver&
         auto mrope_host=image.driver.mrope;
         if (!generation_memory_postcheck(core::conversation_available_memory(),retained,error))
             return refused(4);
-        if (core::conversation_snapshot_restore(image.main,runtime.session,runtime.geometry,
-                static_cast<const core::QsaState*>(nullptr),error)!=core::ConversationRestore::restored)
-            return fatal(runtime,error);
-        if(runtime.proof && runtime.proof->take(ProofFault::restore_after_main,image.driver.request_id)) {
-            error="native proof: injected failure after main transfer";
-            const auto result=fatal(runtime,error);
-            runtime.proof->emit("partial_transfer_poison",image.driver.request_id,runtime.poisoned,
-                *runtime.engine_poisoned,0);return result;
+        if (disk_capsule) {
+            // K/V from the file, resident state after it, the draft layer last - and a capsule whose payload proved
+            // unusable before any write comes back as `lost`, not as a refusal and not as a poisoned engine.
+            const auto disk=restore_spill_kv(image,runtime,error);
+            if (disk!=GenerationTransfer::complete) return disk;
+        } else {
+            if (core::conversation_snapshot_restore(image.main,runtime.session,runtime.geometry,
+                    static_cast<const core::QsaState*>(nullptr),error)!=core::ConversationRestore::restored)
+                return fatal(runtime,error);
+            if(runtime.proof && runtime.proof->take(ProofFault::restore_after_main,image.driver.request_id)) {
+                error="native proof: injected failure after main transfer";
+                const auto result=fatal(runtime,error);
+                runtime.proof->emit("partial_transfer_poison",image.driver.request_id,runtime.poisoned,
+                    *runtime.engine_poisoned,0);return result;
+            }
+            if (runtime.mtp && !runtime.mtp->request_restore(*image.mtp,runtime.session,error))
+                return fatal(runtime,error);
         }
-        if (runtime.mtp && !runtime.mtp->request_restore(*image.mtp,runtime.session,error))
-            return fatal(runtime,error);
         if (!image.driver.mrope.empty() && cudaMemcpy(runtime.mrope_device,image.driver.mrope.data(),
                 image.driver.mrope.size()*sizeof(int32_t),cudaMemcpyHostToDevice)!=cudaSuccess)
             return fatal(runtime,error);
@@ -547,8 +632,11 @@ GenerationTransfer generation_restore(GenerationCapsule& image,GenerationDriver&
         const auto checkpoint_count=image.main.checkpoints.size();
         if(runtime.proof) {
             uint64_t main=0,mtp=0;
-            if(!core::conversation_snapshot_verify(image.main,runtime.session,runtime.geometry,main,error) ||
-               (runtime.mtp && !runtime.mtp->request_verify(*image.mtp,mtp,error)) ||
+            // A disk capsule's K/V was verified block by block as it was read; there is no resident image to re-hash.
+            const bool kv_readback=disk_capsule ||
+                (core::conversation_snapshot_verify(image.main,runtime.session,runtime.geometry,main,error) &&
+                 (!runtime.mtp || runtime.mtp->request_verify(*image.mtp,mtp,error)));
+            if(!kv_readback ||
                !proof_device(runtime.mrope_device,image.driver.mrope.data(),image.driver.mrope.size()*sizeof(int32_t),error) ||
                (image.driver.history_size && !proof_device(runtime.history_device,image.driver.history_stage.data(),
                     image.driver.history_stage.size()*sizeof(int32_t),error)) ||

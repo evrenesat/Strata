@@ -210,7 +210,8 @@ ConversationKvRestoreResult conversation_kv_restore_source(const QsaState& st, c
 
 ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& g,
                                                            const std::vector<ConversationKvTarget>& targets,
-                                                           const KvLayerDriveFn& drive) {
+                                                           const KvLayerDriveFn& drive,
+                                                           const std::function<bool(std::string&)>& before_draft) {
     ConversationKvRestoreResult result;
     if (targets.empty()) { result.error = "conversation snapshot: no K/V layers to restore"; return result; }
     if (!drive) { result.error = "conversation snapshot: no K/V source"; return result; }
@@ -235,10 +236,17 @@ ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& 
         if (!writers[i]) return result;
     }
     const bool has_draft = targets.back().draft;
+    bool draft_hook_ran = false;
     const KvLayerSink sink = [&](size_t layer, bool draft, size_t part, uint64_t offset, const uint8_t* data,
                                  size_t n, std::string& why) -> bool {
         if (draft) {
             if (!has_draft) { why = "conversation snapshot: K/V block for a draft layer this session does not own"; return false; }
+            // Every main block is in place now, so the main layers' recurrent state can be restored before the draft's
+            // own K/V starts: one hook, exactly once, at that boundary.
+            if (!draft_hook_ran) {
+                draft_hook_ran = true;
+                if (before_draft && !before_draft(why)) return false;
+            }
             return writers.back()(part, offset, data, n, why);
         }
         if (layer >= main_layers) { why = "conversation snapshot: K/V block for a layer this session does not own"; return false; }

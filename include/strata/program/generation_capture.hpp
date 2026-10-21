@@ -60,7 +60,10 @@ struct GenerationRuntime {
     // gate itself, so this is called at the start and then only when an event is actually owed.
     std::function<void(uint64_t,uint64_t)> spill_progress;
 };
-enum class GenerationTransfer { complete, refused, transfer_failed };
+// `lost` is the disk capsule's own outcome: its payload was unusable BEFORE any live write (a truncated file, a
+// digest mismatch, a read error at the first block).  The engine is intact and the request ends with one typed
+// terminal, so it is not a refusal to retry and not a poisoned engine.
+enum class GenerationTransfer { complete, refused, lost, transfer_failed };
 // Capture copies authoritative device data, then rechecks RAM, then moves the
 // driver/checkpoints. Refusal preserves them; no replay or cache live_ok needed.
 GenerationTransfer generation_capture(GenerationCapsule&, GenerationDriver&,

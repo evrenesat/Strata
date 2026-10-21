@@ -212,6 +212,9 @@ private:
 struct SpillReadResult {
     bool ok = false;
     uint64_t verified_bytes = 0;
+    // True when the pass never started for an admission reason (buffers could not be allocated, the reader thread could
+    // not start): the capsule is intact and may be retried.  False on any storage or integrity failure.
+    bool admission = false;
     std::string error;
 };
 
@@ -230,15 +233,19 @@ public:
 
     // Validates the manifest's arithmetic, the inode's size and that this process can start the reader thread before
     // anything is read.  `sink` is called with every complete block; an empty sink verifies only.
+    // Takes ownership of `file` immediately: a failed open still HOLDS it, so the caller can take it back with
+    // release_file() and keep the capsule for a retry or a cancellation instead of losing its data.
     static SpillReader open(SpillFile file, const SpillManifest& manifest, std::string& error,
                             const SpillFault& fault = {});
-    bool valid() const { return file_.valid(); }
+    bool valid() const { return opened_; }        // true only when the capsule really opened
+    SpillFile release_file() { return std::move(file_); }
     SpillReadResult run(const SpillSink& sink);
 
 private:
     SpillFile file_;
     SpillManifest manifest_;
     SpillFault fault_;
+    bool opened_ = false;
 };
 
 // The process-lifetime logical bytes every spill writer has written, including partial writes of refused attempts.

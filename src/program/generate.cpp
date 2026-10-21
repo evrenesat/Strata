@@ -607,6 +607,9 @@ struct Options {
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     bool priority_serving = false;
+    // Parked-capsule disk fallback (opt-in): the directory, the mode and the extra free-space reserve.
+    std::string priority_spill_dir, priority_spill_mode = "off";
+    int64_t priority_spill_min_free_mib = 4096;
     bool priority_proof = false; // trusted native fixture only, never exposed by server config
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
@@ -1781,6 +1784,19 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--priority-serving") o.priority_serving = true;
         else if (a == "--priority-proof") o.priority_proof = true;
+        else if (a == "--priority-spill-dir") o.priority_spill_dir = next("--priority-spill-dir");
+        else if (a == "--priority-spill-mode") o.priority_spill_mode = next("--priority-spill-mode");
+        else if (a == "--priority-spill-min-free-mib") {
+            const std::string value = next("--priority-spill-min-free-mib");
+            int64_t number = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || number < 0 ||
+                number > INT64_MAX / 1048576) {
+                std::fprintf(stderr, "--priority-spill-min-free-mib must be a whole number of MiB >= 0\n");
+                return 2;
+            }
+            o.priority_spill_min_free_mib = number;
+        }
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -1922,6 +1938,25 @@ int main(int argc, char** argv) {
 if (o.priority_proof && !o.priority_serving) {
         std::fprintf(stderr,"--priority-proof requires --priority-serving\n");return 2;
     }
+// The parked capsule's disk fallback: validated and pinned ONCE, before the model loads, so a bad configuration
+// fails the start rather than the first park.  `off` (or no directory) keeps the RAM-only path exactly as it was.
+std::optional<strata::core::SpillDirectory> spill_directory;
+if (o.priority_spill_mode != "off" && o.priority_spill_mode != "fallback" && o.priority_spill_mode != "always") {
+    std::fprintf(stderr,"--priority-spill-mode must be off, fallback or always\n");return 2;
+}
+if (o.priority_spill_mode != "off") {
+    if (!o.priority_serving) { std::fprintf(stderr,"--priority-spill-mode requires --priority-serving\n");return 2; }
+    if (o.priority_spill_dir.empty()) { std::fprintf(stderr,"--priority-spill-mode requires --priority-spill-dir\n");return 2; }
+    std::string why;
+    strata::core::SpillDirectory directory = strata::core::SpillDirectory::open(o.priority_spill_dir, why);
+    if (!directory.valid() || !directory.anonymous_supported(why)) {
+        std::fprintf(stderr,"--priority-spill-dir refused: %s\n", why.c_str());
+        return 2;
+    }
+    if (o.priority_spill_mode == "always")
+        std::fprintf(stderr,"priority spill mode 'always' is a TESTING-ONLY override: every park is written to disk\n");
+    spill_directory = std::move(directory);
+}
 if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pipeline_windows ||
         o.lookup_chain || std::any_of(o.expert_cache_remote.begin(),o.expert_cache_remote.end(),
                                     [](int64_t n){return n>0;}))) {
@@ -7969,7 +8004,8 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     }
                 }).detach();
         }
-        if (o.priority_serving) protocol_printf("INFO priority_protocol=1 priority_backfill=1 priority_prefill_max=2048\n");
+        if (o.priority_serving) protocol_printf("INFO priority_protocol=1 priority_backfill=1 priority_prefill_max=2048%s\n",
+            spill_directory ? " priority_spill=1" : "");
         protocol_printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -9742,6 +9778,11 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     live_ok=false; cvec_cached=mode;
                 };
                 r.proof=o.priority_proof ? &native_proof:nullptr;
+                // Disk fallback: only a directory that passed the startup checks enables it, and `always` is the
+                // testing override that skips the RAM attempt.
+                r.spill_dir=spill_directory ? &*spill_directory : nullptr;
+                r.spill_always=o.priority_spill_mode=="always";
+                r.spill_min_free_bytes=uint64_t(o.priority_spill_min_free_mib)*1048576;
                 return r;
             };
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
@@ -9907,6 +9948,15 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                         std::fflush(stdout); return 0;
                     }
                 }
+                // The publish budget starts here, when the pause is accepted: the drain and a refused RAM attempt
+                // both eat into it.
+                runtime->capture_deadline=std::chrono::steady_clock::now()+
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::duration<double>(strata::core::kSpillCaptureBudgetSeconds));
+                runtime->spill_progress=[&](uint64_t,uint64_t) {
+                    std::fprintf(stdout,"R %llu BLOCK state_transfer 180\n",(unsigned long long)request_id);
+                    std::fflush(stdout);
+                };
                 auto result=strata::program::generation_capture(parked,request,checks,*runtime,err);
                 if (result==strata::program::GenerationTransfer::transfer_failed) return transfer_fatal();
                 if (result!=strata::program::GenerationTransfer::complete) {
@@ -9930,9 +9980,10 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                         hot.reset();
                     } catch (const std::bad_alloc&) { return transfer_fatal(); }
                 }
-                std::fprintf(stdout,"PAUSED %llu %s %lld %lld\n",(unsigned long long)request_id,
+                std::fprintf(stdout,"PAUSED %llu %s %lld %lld%s\n",(unsigned long long)request_id,
                     parked.saved_phase==strata::program::GenerationPhase::prefill ? "prefill" : "decode",
-                    (long long)parked.driver.position,(long long)parked.driver.produced);
+                    (long long)parked.driver.position,(long long)parked.driver.produced,
+                    parked.spill ? " spill=1" : "");
                 std::fflush(stdout);
                 for (;;) {
                     strata::core::progress().busy.store(false);
@@ -9990,6 +10041,15 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     if (!resume_runtime) return transfer_fatal();
                     const auto restored=strata::program::generation_restore(parked,request,checks,*resume_runtime,err);
                     if (restored==strata::program::GenerationTransfer::transfer_failed) return transfer_fatal();
+                    if (restored==strata::program::GenerationTransfer::lost) {
+                        // The capsule's payload proved unusable before any live write: the engine is intact, so this
+                        // request ends with ONE typed terminal and the outer loop takes the next request.  No
+                        // RESUMED, no DONE, no retry, no PCANCEL.
+                        parked_id=0; parked_cancelled=false;
+                        std::fprintf(stdout,"R %llu ERR priority_spill_lost\n",(unsigned long long)request_id);
+                        std::fflush(stdout);
+                        return 3;
+                    }
                     if (restored!=strata::program::GenerationTransfer::complete) {
                         // Restore refused before mutation. Put moved foreground
                         // checkpoints back so it remains the truthful hot owner.

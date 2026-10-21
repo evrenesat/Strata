@@ -755,12 +755,14 @@ SpillReader& SpillReader::operator=(SpillReader&&) noexcept = default;
 SpillReader SpillReader::open(SpillFile file, const SpillManifest& manifest, std::string& error,
                               const SpillFault& fault) {
     SpillReader reader;
+    // Take the descriptor FIRST: every refusal below then leaves the capsule intact, and the caller can reclaim it.
+    reader.file_ = std::move(file);
     if (!spill_manifest_check(manifest, error)) return reader;
-    if (!file.valid()) {
+    if (!reader.file_.valid()) {
         error = "spill file is not open";
         return reader;
     }
-    const auto size = file.size();
+    const auto size = reader.file_.size();
     if (!size || *size != manifest.payload_bytes) {
         error = "spill file size does not match the manifest";
         return reader;
@@ -769,14 +771,19 @@ SpillReader SpillReader::open(SpillFile file, const SpillManifest& manifest, std
     // Sequential, one pass, never re-read: tell the kernel not to build a read-ahead window we will not use.
     (void)::posix_fadvise(file.fd(), 0, 0, POSIX_FADV_RANDOM);
 #endif
-    reader.file_ = std::move(file);
     reader.manifest_ = manifest;
     reader.fault_ = fault;
+    reader.opened_ = true;
     return reader;
 }
 
 SpillReadResult SpillReader::run(const SpillSink& sink) {
     SpillReadResult result;
+    if (!opened_) {
+        result.error = "spill capsule was not opened";
+        result.admission = true;
+        return result;
+    }
     if (!file_.valid()) {
         result.error = "spill file is not open";
         return result;
@@ -793,7 +800,8 @@ SpillReadResult SpillReader::run(const SpillSink& sink) {
         for (ReadSlot& slot : slots) slot.data.resize(static_cast<size_t>(kSpillBlockBytes));
     } catch (const std::bad_alloc&) {
         result.error = "spill read buffers could not be allocated";
-        return result;      // before any read and before any live mutation
+        result.admission = true;   // before any read and before any live mutation: the capsule may be retried
+        return result;
     }
     ReaderShared shared;
     const int fd = file_.fd();
@@ -830,7 +838,8 @@ SpillReadResult SpillReader::run(const SpillSink& sink) {
         });
     } catch (const std::system_error&) {
         result.error = "spill reader thread could not be started";
-        return result;      // nothing was read and no live state was touched
+        result.admission = true;   // nothing was read and no live state was touched
+        return result;
     }
 
     const auto stop_and_join = [&shared, &reader_thread]() {

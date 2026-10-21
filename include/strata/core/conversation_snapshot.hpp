@@ -7,6 +7,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <functional>
 #include <string>
 
 namespace strata::core {
@@ -76,9 +77,13 @@ struct ConversationKvTarget {
 // Restore every layer of a capsule from ONE verified pass under ONE mutation boundary: all layouts are validated and
 // every destination prepared before the first write, each block goes to its own layer, and the residency finish runs
 // for every layer after the last write.  `invalid` means nothing was written.
+// `before_draft`, when set, runs exactly once immediately before the draft entry's first block is written - after
+// every main block has been.  That is where a capsule restores the main layers' RECURRENT state, so the order stays
+// K/V, then recurrent state, then the draft's own K/V.  It is not called when the capsule has no draft entry.
 ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& g,
                                                            const std::vector<ConversationKvTarget>& targets,
-                                                           const KvLayerDriveFn& drive);
+                                                           const KvLayerDriveFn& drive,
+                                                           const std::function<bool(std::string&)>& before_draft = {});
 
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
