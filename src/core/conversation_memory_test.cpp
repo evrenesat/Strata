@@ -189,6 +189,115 @@ int main() {
         tree.write(tree.root / "memory/job/memory.usage_in_bytes", "500\n");
         check(tree.read().available == 8500, "the v1 parent binds an unlimited leaf");
     }
+    // ---- reclaimable-file credit: mapped inactive cache is not live pressure ----
+    // The strict parser first: only clean, inactive cache is creditable, and only up to usage.
+    {
+        std::istringstream stat("anon 100\nfile 800\nactive_file 100\ninactive_file 700\n"
+                                "file_dirty 10\nfile_writeback 5\n");
+        check(conversation_cgroup_memory_credit(stat, 900, false) == 685,
+              "credit is min(inactive,file) minus dirty/writeback, clamped by usage");
+        std::istringstream clamp("inactive_file 5000\nfile 4000\nfile_dirty 0\nfile_writeback 0\n");
+        check(conversation_cgroup_memory_credit(clamp, 4000, false) == 4000,
+              "credit never exceeds usage");
+        std::istringstream over("inactive_file 100\nfile 100\n"
+                                "file_dirty 9223372036854775807\n"
+                                "file_writeback 9223372036854775807\n");
+        check(conversation_cgroup_memory_credit(over, 1000, false) == 0,
+              "dirty/writeback addition saturates instead of overflowing");
+        for (const char* bad : {
+                 "inactive_file 100\nfile 200\nfile_dirty 10\n",                       // missing key
+                 "inactive_file 100\nfile 200\nfile_dirty 10\nfile_writeback 5\n"
+                 "file_dirty 6\n",                                                    // duplicate key
+                 "inactive_file -1\nfile 200\nfile_dirty 10\nfile_writeback 5\n",      // signed
+                 "inactive_file +1\nfile 200\nfile_dirty 10\nfile_writeback 5\n",      // signed
+                 "inactive_file 100 extra\nfile 200\nfile_dirty 10\nfile_writeback 5\n",
+                 "inactive_file 1x\nfile 200\nfile_dirty 10\nfile_writeback 5\n",
+                 "inactive_file 100\nfile 200\nfile_dirty 10\nfile_writeback 5\n"
+                 "file_writeback duplicate\n",
+                 "inactive_file 100\nfile 200\nfile_dirty 18446744073709551616\n"
+                 "file_writeback 5\n",                                                // out of range
+             }) {
+            std::istringstream input(bad);
+            check(!conversation_cgroup_memory_credit(input, 1000, false),
+                  "unusable stat telemetry grants no credit");
+        }
+        std::istringstream unrelated_only("anon 500\nslab 20\n");
+        check(!conversation_cgroup_memory_credit(unrelated_only, 1000, false),
+              "unrelated keys alone are not a credit");
+        std::istringstream v1("total_inactive_file 400\ntotal_cache 600\n"
+                              "total_dirty 0\ntotal_writeback 0\n");
+        check(conversation_cgroup_memory_credit(v1, 1000, true) == 400,
+              "v1 hierarchical totals produce credit");
+    }
+    // v2 level: the mapped inactive cache fills the raw limit, yet resident work still fits.
+    {
+        CgroupTree tree("strata-cgmem-credit-v2");
+        tree.write(tree.proc(), "0::/job\n");
+        tree.write(tree.root / "job" / "memory.max", "10000\n");
+        tree.write(tree.root / "job" / "memory.current", "9000\n");
+        tree.write(tree.root / "job" / "memory.stat",
+                   "anon 1000\nfile 8000\nactive_file 1000\ninactive_file 7000\n"
+                   "file_dirty 0\nfile_writeback 0\n");
+        const auto bound = tree.read();
+        check(bound.available == 8000, "inactive file cache is not live pressure");
+        check(bound.usage == 9000 && bound.credit == 7000,
+              "raw usage and applied credit stay reportable");
+        check(conversation_memory_bound(1ULL << 40, bound) == 8000, "credit binds the budget");
+        check(conversation_memory_admit(bound.available, 4000, 2560),
+              "a modest resident allocation fits under reclaimable cache");
+        // Anonymous use, not cache, is what must still fit.
+        tree.write(tree.root / "job" / "memory.current", "9000\n");
+        tree.write(tree.root / "job" / "memory.stat",
+                   "anon 8500\nfile 500\nactive_file 0\ninactive_file 500\n"
+                   "file_dirty 0\nfile_writeback 0\n");
+        check(tree.read().available == 1500, "anonymous pressure is not credited");
+        check(!conversation_memory_admit(tree.read().available, 3000, 0),
+              "an anonymous allocation beyond the corrected allowance is refused");
+        // Dirty and writeback bytes cannot be reclaimed, so they remove credit.
+        tree.write(tree.root / "job" / "memory.stat",
+                   "anon 1000\nfile 8000\nactive_file 1000\ninactive_file 7000\n"
+                   "file_dirty 6000\nfile_writeback 500\n");
+        check(tree.read().available == 1500, "dirty and writeback remove credit");
+        // A stat file that is absent, empty or unusable keeps the old conservative bound.
+        std::error_code ignored;
+        fs::remove(tree.root / "job" / "memory.stat", ignored);
+        check(tree.read().available == 1000, "absent stat telemetry grants no credit");
+        tree.write(tree.root / "job" / "memory.stat", "");
+        check(tree.read().available == 1000, "empty stat telemetry grants no credit");
+        tree.write(tree.root / "job" / "memory.stat", "inactive_file 7000\nfile nope\n");
+        check(tree.read().available == 1000, "malformed stat telemetry grants no credit");
+    }
+    // v1 level uses its hierarchical totals.
+    {
+        CgroupTree tree("strata-cgmem-credit-v1");
+        tree.write(tree.proc(), "9:memory:/jobA\n");
+        tree.write(tree.root / "memory" / "jobA" / "memory.limit_in_bytes", "10000\n");
+        tree.write(tree.root / "memory" / "jobA" / "memory.usage_in_bytes", "9000\n");
+        tree.write(tree.root / "memory" / "jobA" / "memory.stat",
+                   "total_inactive_file 6000\ntotal_cache 8000\ntotal_dirty 100\n"
+                   "total_writeback 0\n");
+        check(tree.read().available == 6900, "v1 hierarchical totals produce credit");
+    }
+    // Hierarchy: credit never lifts an ancestor bound, and an unlimited leaf stays bounded.
+    {
+        CgroupTree tree("strata-cgmem-credit-nest");
+        tree.write(tree.proc(), "0::/slice/leaf\n");
+        tree.write(tree.root / "slice/leaf" / "memory.max", "max\n");
+        tree.write(tree.root / "slice/leaf" / "memory.current", "0\n");
+        tree.write(tree.root / "slice/leaf" / "memory.stat",
+                   "inactive_file 50000\nfile 50000\nfile_dirty 0\nfile_writeback 0\n");
+        tree.write(tree.root / "slice" / "memory.max", "8000\n");
+        tree.write(tree.root / "slice" / "memory.current", "1000\n");
+        tree.write(tree.root / "slice" / "memory.stat",
+                   "inactive_file 200\nfile 300\nfile_dirty 0\nfile_writeback 0\n");
+        const auto bound = tree.read();
+        check(bound.available == 7200, "an unlimited leaf stays bounded by its ancestor");
+        check(bound.credit == 200 && bound.usage == 1000,
+              "the binding level reports its own usage and credit");
+        tree.write(tree.root / "slice" / "memory.current", "1000\n");
+        tree.write(tree.root / "slice" / "memory.stat", "inactive_file 0\nfile 0\n");
+        check(tree.read().available == 7000, "an ancestor without credit keeps its bound");
+    }
     // The real provider still returns bytes or unknown, whichever the host truth is.
     {
         const auto available = conversation_available_memory();

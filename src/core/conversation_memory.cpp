@@ -46,7 +46,53 @@ std::string cgroup_relative_path(const std::string& path) {
     return path;                                  // always starts with '/' when non-empty
 }
 
+uint64_t saturating_add(uint64_t a, uint64_t b) {
+    const auto max = std::numeric_limits<uint64_t>::max();
+    return b > max - a ? max : a + b;
+}
+
 } // namespace
+
+// The credit is a reclamation estimate, so every unusable input withdraws it completely: a
+// missing key, a repeated key, a token that is not strict unsigned decimal, or an I/O failure
+// all return no value and the caller keeps the older, fully conservative bound.
+std::optional<uint64_t> conversation_cgroup_memory_credit(std::istream& stat, uint64_t usage,
+                                                          bool v1_stats) {
+    const char* const names[4] = {
+        v1_stats ? "total_inactive_file" : "inactive_file",
+        v1_stats ? "total_cache" : "file",
+        v1_stats ? "total_dirty" : "file_dirty",
+        v1_stats ? "total_writeback" : "file_writeback",
+    };
+    if (!stat) return {};
+    std::optional<uint64_t> found[4];
+    std::string line;
+    while (std::getline(stat, line)) {
+        std::istringstream fields(line);
+        std::string key, token, extra;
+        if (!(fields >> key)) continue;                    // blank line
+        const auto slot = [&]() -> int {
+            for (int i = 0; i < 4; ++i) if (key == names[i]) return i;
+            return -1;
+        }();
+        if (!(fields >> token) || (fields >> extra)) {     // no value, or trailing fields
+            if (slot >= 0) return {};
+            continue;
+        }
+        if (slot < 0) continue;                            // an unrelated stat key
+        if (found[slot]) return {};                        // a repeated required key
+        uint64_t value = 0;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) return {};
+        found[slot] = value;
+    }
+    if (stat.bad() || (stat.fail() && !stat.eof())) return {};   // a partial or failed read
+    for (const auto& value : found) if (!value) return {};       // a missing required key
+    const uint64_t reclaimable = std::min(*found[0], *found[1]);
+    const uint64_t unwritten = saturating_add(*found[2], *found[3]);
+    const uint64_t clean = reclaimable > unwritten ? reclaimable - unwritten : 0;
+    return std::min(usage, clean);                            // never credit more than usage
+}
 
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
     std::optional<uint64_t> result;
@@ -105,35 +151,43 @@ ConversationCgroupMemory conversation_cgroup_memory(const std::string& proc_cgro
         }
     }
     if (self_cgroup.bad()) return {};
-    const auto allowance = [&](const std::string& limit_file, const std::string& usage_file)
-        -> ConversationCgroupMemory {
-        const auto limit = read_cgroup_limit(limit_file);
-        if (!limit) return {true, {}};            // discovered but unreadable: fail closed
-        if (*limit == std::numeric_limits<uint64_t>::max()) return {true, *limit};  // no bound
-        const auto used = read_cgroup_usage(usage_file);
-        if (!used) return {true, {}};             // a real limit whose usage cannot be read
-        return {true, *limit > *used ? *limit - *used : 0};
+    // One bounded level: the limit file, the usage file and the level's memory.stat.  A missing
+    // or unreadable stat file grants no credit, which keeps the pre-credit conservative bound.
+    const auto allowance = [&](const std::string& base, const std::string& limit_suffix,
+                               const std::string& usage_suffix,
+                               bool v1_stats) -> ConversationCgroupMemory {
+        const auto limit = read_cgroup_limit(base + limit_suffix);
+        if (!limit) return {true, {}, {}, {}};    // discovered but unreadable: fail closed
+        if (*limit == std::numeric_limits<uint64_t>::max()) return {true, *limit, {}, {}};  // no bound
+        const auto used = read_cgroup_usage(base + usage_suffix);
+        if (!used) return {true, {}, {}, {}};     // a real limit whose usage cannot be read
+        uint64_t credit = 0;
+        if (std::ifstream stat(base + "/memory.stat"); stat)
+            credit = conversation_cgroup_memory_credit(stat, *used, v1_stats).value_or(0);
+        const auto effective_used = *used > credit ? *used - credit : 0;
+        return {true, *limit > effective_used ? *limit - effective_used : 0, *used, credit};
     };
     // Limits are hierarchical: an ancestor's memory.max binds the process even when the
     // leaf is "max", so walk every level from the leaf to the hierarchy root and keep the
     // smallest allowance seen.  A missing limit file at a level means that level is unbound.
-    const auto walk = [&](const std::string& base, const std::string& limit_suffix,
-                          const std::string& usage_suffix) -> ConversationCgroupMemory {
-        std::string path = cgroup_relative_path(base);
-        std::optional<uint64_t> bound;            // the smallest level allowance seen
+    const auto walk = [&](const std::string& prefix, const std::string& start,
+                          const std::string& limit_suffix, const std::string& usage_suffix,
+                          bool v1_stats) -> ConversationCgroupMemory {
+        std::string path = cgroup_relative_path(start);
+        ConversationCgroupMemory bound;           // the smallest level allowance seen
         while (true) {
-            const auto level = allowance(root + path + limit_suffix, root + path + usage_suffix);
-            if (!level.available) return {true, {}};      // a discovered level that cannot be read
-            if (!bound || *level.available < *bound) bound = level.available;
+            const auto level = allowance(prefix + path, limit_suffix, usage_suffix, v1_stats);
+            if (!level.available) return {true, {}, {}, {}};   // a level that cannot be read
+            if (!bound.available || *level.available < *bound.available) bound = level;
             if (path.empty() || path == "/") break;
             const auto slash = path.rfind('/');
             path = slash == std::string::npos ? std::string() : path.substr(0, slash);
         }
-        return {true, bound};
+        return bound;
     };
-    if (v2_path) return walk(*v2_path, "/memory.max", "/memory.current");
-    if (v1_path) return walk("/memory" + cgroup_relative_path(*v1_path),
-                             "/memory.limit_in_bytes", "/memory.usage_in_bytes");
+    if (v2_path) return walk(root, *v2_path, "/memory.max", "/memory.current", false);
+    if (v1_path) return walk(root + "/memory", *v1_path, "/memory.limit_in_bytes",
+                             "/memory.usage_in_bytes", true);
     return {};                                    // no memory controller: the host view alone applies
 }
 
