@@ -270,6 +270,70 @@ ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& 
     return result;
 }
 
+ConversationKvRestoreResult conversation_kv_compare_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive, uint64_t& fingerprint) {
+    ConversationKvRestoreResult result;
+    fingerprint = 1469598103934665603ull;
+    if (targets.empty()) { result.error = "conversation snapshot: no K/V layers to compare"; return result; }
+    if (!drive) { result.error = "conversation snapshot: no K/V source"; return result; }
+    size_t main_layers = 0;
+    std::vector<Layout> layouts(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].draft && i + 1 != targets.size()) {
+            result.error = "conversation snapshot: the draft entry must be the last target";
+            return result;
+        }
+        if (!targets[i].draft) ++main_layers;
+        if (!targets[i].state) { result.error = "conversation snapshot: missing K/V target state"; return result; }
+        if (!conversation_kv_layout(*targets[i].state, g, targets[i].upto, !targets[i].draft, layouts[i],
+                                    result.error)) return result;
+    }
+    const bool has_draft = targets.back().draft;
+    uint64_t hash = fingerprint;
+    std::array<uint8_t, 65536> scratch;
+    // A compare-only walk: nothing is written, so this needs no mutation boundary - it either matches or it does not.
+    const auto compare_block = [&](size_t index, size_t part, uint64_t offset, const uint8_t* data, size_t n,
+                                   std::string& why) -> bool {
+        const auto sizes = layouts[index].part_sizes();
+        if (part >= sizes.size() || offset > sizes[part] || n > sizes[part] - offset) {
+            why = "conversation snapshot: K/V block out of range";
+            return false;
+        }
+        const auto pools = ::strata::core::pools(*targets[index].state);   // the live destination
+        const auto* device = static_cast<const uint8_t*>(pools[part]) + offset;
+        for (size_t at = 0; at < n;) {
+            const size_t take = std::min(scratch.size(), n - at);
+            if (!transfer(scratch.data(), device + at, take, why)) return false;
+            if (std::memcmp(scratch.data(), data + at, take) != 0) {
+                why = "conversation snapshot: restored K/V bytes differ";
+                return false;
+            }
+            for (size_t i = 0; i < take; ++i) { hash ^= scratch[i]; hash *= 1099511628211ull; }
+            at += take;
+        }
+        return true;
+    };
+    const KvLayerSink sink = [&](size_t layer, bool draft, size_t part, uint64_t offset, const uint8_t* data,
+                                 size_t n, std::string& why) -> bool {
+        if (draft) {
+            if (!has_draft) { why = "conversation snapshot: K/V block for a draft layer this session does not own"; return false; }
+            return compare_block(targets.size() - 1, part, offset, data, n, why);
+        }
+        if (layer >= main_layers) { why = "conversation snapshot: K/V block for a layer this session does not own"; return false; }
+        return compare_block(layer, part, offset, data, n, why);
+    };
+    const KvTransferResult ran = kv_layer_transfer_run(drive, sink);
+    result.detail = ran.outcome;
+    result.verified_bytes = ran.verified_bytes;
+    result.error = ran.error;
+    fingerprint = hash;
+    result.outcome = ran.ok ? ConversationRestore::restored
+                            : (ran.outcome == KvTransferOutcome::fatal ? ConversationRestore::transfer_failed
+                                                                      : ConversationRestore::invalid);
+    return result;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};

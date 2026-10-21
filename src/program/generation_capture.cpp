@@ -232,13 +232,16 @@ core::SpillLayer spill_entry(int64_t layer,const core::SessionKvSource& src,bool
 // storage failure with `error` set by whichever side failed.
 bool spill_stream_parts(const core::SessionKvSource& src,core::SpillWriter& writer,uint64_t& written,
                         const std::chrono::steady_clock::time_point deadline,const std::function<void(uint64_t)>& progress,
-                        std::string& error) {
+                        std::string& error,bool& source_failed) {
     for (size_t part=0;part<core::kSpillParts;++part) {
         uint64_t offset=0;
         while (offset<src.sizes[part]) {
             const size_t chunk=size_t(std::min<uint64_t>(core::kSpillBlockBytes,src.sizes[part]-offset));
             if (!writer.append_filled(chunk,[&](uint8_t* dst,size_t n,std::string& why) {
+                    // A failed device read is NOT a storage refusal: the device may be faulted, so the caller must take
+                    // the poison path rather than keep decoding.  `source_failed` tells them apart.
                     if (!src.read || !src.read(part,offset,dst,n)) {
+                        source_failed=true;
                         why=src.error && !src.error().empty() ? src.error() : "spill source read failed";
                         return false;
                     }
@@ -311,7 +314,10 @@ GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver
         }
         // Memory: what this capture keeps resident (driver, checkpoints, the MTP resident state, the manifest) against
         // what it adds (one staging block, the proof scratch).  The K/V itself is not resident at any point.
+        // What the capture ADDS: one 16 MiB staging block (plus the proof scratch) and, while a window is
+        // outstanding, up to one 64 MiB writeback of dirty cache.
         size_t retained=sizeof(GenerationCapsule),additional=core::spill_capture_additional_bytes();
+        if (!add(additional,core::kSpillWritebackBytes)) return GenerationTransfer::refused;
         if (!add(retained,driver.bytes()) || !add(retained,checks.capacity()*sizeof(core::ConversationCheckpoint)))
             return GenerationTransfer::refused;
         for (const auto& c:checks) if (!add(retained,c.bytes())) return GenerationTransfer::refused;
@@ -341,7 +347,8 @@ GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver
         for (size_t i=0;i<sources.size();++i) {
             // Proof fault: a GPU source read failure is FATAL, never a storage refusal that would keep decoding.
             const bool injected=runtime.proof && runtime.proof->take(ProofFault::spill_source_copy,fault_id);
-            const bool copied=!injected && spill_stream_parts(sources[i],writer,written,deadline,progress,error);
+            const bool copied=!injected &&
+                spill_stream_parts(sources[i],writer,written,deadline,progress,error,source_failed);
             if (!copied) {
                 if (injected) {
                     source_failed=true;
@@ -352,8 +359,11 @@ GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver
             }
         }
         if (source_failed) return fatal(runtime,error);
-        if (with_draft && !spill_stream_parts(draft_source,writer,written,deadline,progress,error))
+        if (with_draft && !spill_stream_parts(draft_source,writer,written,deadline,progress,error,source_failed)) {
+            if (source_failed) { if (error.empty()) error="spill source read failed"; return fatal(runtime,error); }
             return GenerationTransfer::refused;
+        }
+        if (source_failed) { if (error.empty()) error="spill source read failed"; return fatal(runtime,error); }
         if (!writer.finish(error)) return GenerationTransfer::refused;
         // A capture that finished after its budget is never published.
         if (std::chrono::steady_clock::now()>deadline) {
@@ -454,14 +464,16 @@ GenerationTransfer restore_spill_kv(GenerationCapsule& image,GenerationRuntime& 
     if (!image.spill) { error="generation capsule has no spill to restore"; return GenerationTransfer::refused; }
     std::optional<CapsuleSpill> spill=image.release_spill();
     core::SpillReader reader=core::SpillReader::open(std::move(spill->file),spill->manifest,error);
-    if (!reader.valid()) {
-        // Validation refused it (or the file is not what the manifest describes): give the capsule its file back so a
-        // retry or a cancellation can still close it, exactly as the RAM refusal path allows.
+    // Every REFUSAL returns the descriptor to the capsule: a memory or admission refusal must leave the capsule able
+    // to retry or to be cancelled, exactly as the RAM refusal path allows.  The reader owns it until then.
+    const auto return_capsule=[&]() {
         spill->file=reader.release_file();
         image.spill=std::move(spill);
+    };
+    if (!reader.valid()) {
+        return_capsule();
         return GenerationTransfer::refused;
     }
-    spill.reset();   // the reader owns the descriptor from here on
     std::vector<core::ConversationKvTarget> targets;
     for (const auto* state:spill_layer_states(runtime))
         targets.push_back({state,false,image.driver.position});
@@ -493,7 +505,9 @@ GenerationTransfer restore_spill_kv(GenerationCapsule& image,GenerationRuntime& 
     if (restored.outcome!=core::ConversationRestore::restored) {
         error=restored.error;
         if (restored.detail==core::KvTransferOutcome::fatal) return fatal(runtime,error);
-        return restored.detail==core::KvTransferOutcome::lost ? GenerationTransfer::lost : GenerationTransfer::refused;
+        if (restored.detail==core::KvTransferOutcome::lost) return GenerationTransfer::lost;   // capsule is dead
+        return_capsule();                        // an admission refusal keeps the capsule for the next attempt
+        return GenerationTransfer::refused;
     }
     // Without a draft entry the hook never runs; with one it runs before the draft's first block.  Either way the
     // main layers' recurrent state is restored exactly once, and only after their K/V is in place.
@@ -501,6 +515,18 @@ GenerationTransfer restore_spill_kv(GenerationCapsule& image,GenerationRuntime& 
     // Main K/V and recurrent state are in place; now the draft layer's working state (its K/V came last in the pass).
     if (has_draft && !runtime.mtp->request_restore_resident(*image.mtp,runtime.session,error))
         return fatal(runtime,error);
+    if (runtime.proof) {
+        // Proof readback: re-read the capsule and compare every block with the live device pages.  The block digests
+        // proved the FILE matched its manifest; only this proves the restore put those bytes in the right pages, and
+        // it needs no host copy of the K/V.
+        uint64_t fingerprint=0;
+        const auto compared=core::conversation_kv_compare_layers(runtime.geometry,targets,drive,fingerprint);
+        if (compared.outcome!=core::ConversationRestore::restored) {
+            error=compared.error.empty() ? "spill proof readback failed" : compared.error;
+            return fatal(runtime,error);
+        }
+        runtime.proof->emit("spill_restore",image.driver.request_id,compared.verified_bytes,fingerprint,0);
+    }
     return GenerationTransfer::complete;
 }
 }  // namespace
@@ -579,6 +605,8 @@ GenerationTransfer generation_restore(GenerationCapsule& image,GenerationDriver&
                 image.driver.image_row_offsets.size()*sizeof(const float*),
                 image.mtp ? (image.mtp->top2.size()+image.mtp->debug_logits.size())*sizeof(int32_t) : 0})
             if (!add(extra,n)) return refused(2);
+        // A disk capsule's restore also holds the reader's two buffers, its allowance and the read-cache allowance.
+        if (disk_capsule && !add(extra,core::spill_restore_additional_bytes())) return refused(2);
         size_t retained=image.bytes();
         if(runtime.proof && (!add(extra,proof_scratch) || !add(retained,proof_scratch)))
             return refused(2);
@@ -642,7 +670,8 @@ GenerationTransfer generation_restore(GenerationCapsule& image,GenerationDriver&
         const auto checkpoint_count=image.main.checkpoints.size();
         if(runtime.proof) {
             uint64_t main=0,mtp=0;
-            // A disk capsule's K/V was verified block by block as it was read; there is no resident image to re-hash.
+            // A disk capsule's K/V was verified block by block as it was read, and the proof run compared every block
+            // with the live device pages in restore_spill_kv; there is no resident image to re-hash here.
             const bool kv_readback=disk_capsule ||
                 (core::conversation_snapshot_verify(image.main,runtime.session,runtime.geometry,main,error) &&
                  (!runtime.mtp || runtime.mtp->request_verify(*image.mtp,mtp,error)));

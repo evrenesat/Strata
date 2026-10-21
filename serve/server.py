@@ -2328,6 +2328,8 @@ def prepare_spill_directory(path: str) -> None:
     if not isinstance(path, str) or not os.path.isabs(path):
         raise ValueError(f'spill directory must be an absolute path, not {path!r}')
     parts = [part for part in path.split(os.sep) if part]
+    if not parts:
+        raise ValueError('spill directory must not be the filesystem root')
     if any(part in ('.', '..') for part in parts):
         raise ValueError('spill directory must not contain "." or ".." components')
     current = os.sep

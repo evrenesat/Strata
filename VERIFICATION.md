@@ -114,6 +114,12 @@ Docker volume does not prove its backing filesystem - check the mounted director
   still exceed the deadline, and the engine's existing watchdog covers that case.
 - **Writes are buffered and written back every 64 MiB** (`sync_file_range` then `posix_fadvise`), and the final tail
   is flushed before the capsule is published, so captured bytes do not pile up as dirty page cache.
+- **The capture-time estimate is deliberately conservative**: it assumes at most 128 MiB/s even when the disk measured
+  faster, so a fast disk can never make a prediction optimistic.  With the 60 s budget that bounds a spillable payload
+  at roughly 4.7 GiB - comfortably above a near-limit 262K-token capsule (~4 GB), which is what the feature is for -
+  and the pause drain and a refused RAM attempt both eat into the same budget.
+- **The read cache is dropped as it goes**: each restored block's pages are released after the block is consumed, so a
+  long restore does not leave the whole payload in the page cache behind work that is itself under memory pressure.
 - **The write counter is logical bytes**, including partial writes of attempts that were later refused.  It is not a
   measure of physical device writes, and it is not framed as drive wear.
 - **Corruption handling is one-pass**: every block is verified against its digest before it is used, and any recovery

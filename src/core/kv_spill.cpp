@@ -429,6 +429,13 @@ SpillDirectory SpillDirectory::open(const std::string& path, std::string& error,
     // Every component is opened without following a link, so a replaced path cannot redirect this descriptor later.
     std::string rest = path;
     while (!rest.empty() && rest.front() == '/') rest.erase(rest.begin());
+    if (rest.empty()) {
+        // "/" has no component to check: ownership, mode and the filesystem of the root are not this process's, and
+        // writing a capsule there is never the intent.
+        error = "spill directory must not be the filesystem root";
+        ::close(current);
+        return dir;
+    }
     while (!rest.empty()) {
         const size_t slash = rest.find('/');
         const std::string component = rest.substr(0, slash);
@@ -768,8 +775,9 @@ SpillReader SpillReader::open(SpillFile file, const SpillManifest& manifest, std
         return reader;
     }
 #if defined(__linux__)
-    // Sequential, one pass, never re-read: tell the kernel not to build a read-ahead window we will not use.
-    (void)::posix_fadvise(file.fd(), 0, 0, POSIX_FADV_RANDOM);
+    // Sequential, one pass, never re-read: tell the kernel not to build a read-ahead window we will not use.  The
+    // descriptor belongs to the reader by now (`file` was moved into it), so this must name reader.file_.
+    (void)::posix_fadvise(reader.file_.fd(), 0, 0, POSIX_FADV_RANDOM);
 #endif
     reader.manifest_ = manifest;
     reader.fault_ = fault;
@@ -900,6 +908,12 @@ SpillReadResult SpillReader::run(const SpillSink& sink) {
             slot.state = SlotState::free;
         }
         shared.reader_ready.notify_one();
+#if defined(__linux__)
+        // This block will not be read again: drop its pages so a long capsule does not leave the whole payload in the
+        // page cache behind a restore that is itself under memory pressure.
+        (void)::posix_fadvise(fd, static_cast<off_t>(blocks[i].file_offset),
+                              static_cast<off_t>(blocks[i].size), POSIX_FADV_DONTNEED);
+#endif
     }
     stop_and_join();
     result.ok = true;

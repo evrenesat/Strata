@@ -85,6 +85,13 @@ ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& 
                                                            const KvLayerDriveFn& drive,
                                                            const std::function<bool(std::string&)>& before_draft = {});
 
+// Proof readback for a capsule: the same one-pass walk, but each block is COMPARED with the live pools instead of
+// written to them, and hashed into `fingerprint`.  This is what proves a streamed restore put the bytes in the right
+// device pages - the block digests only prove the file matched its manifest.  No host copy of the K/V is made.
+ConversationKvRestoreResult conversation_kv_compare_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive, uint64_t& fingerprint);
+
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);

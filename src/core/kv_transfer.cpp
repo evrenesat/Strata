@@ -6,7 +6,8 @@ namespace strata::core {
 
 namespace {
 // The one place the ending is classified, for both entry points.
-KvTransferResult classify(bool ok, bool sink_refused, bool mutated, uint64_t verified, std::string error) {
+KvTransferResult classify(KvDrive drove, bool sink_refused, bool mutated, uint64_t verified, std::string error) {
+    const bool ok = drove == KvDrive::ok;
     KvTransferResult result;
     result.mutated = mutated;
     result.verified_bytes = verified;
@@ -21,7 +22,9 @@ KvTransferResult classify(bool ok, bool sink_refused, bool mutated, uint64_t ver
         if (result.error.empty()) result.error = "K/V restore failed after live state was written";
         return result;
     }
-    result.outcome = sink_refused ? KvTransferOutcome::lost : KvTransferOutcome::refused;
+    // A sink refusal and a source that reports loss both mean the payload was unusable; only a plain driver refusal
+    // is the recoverable "nothing was transferred" case.
+    result.outcome = (sink_refused || drove == KvDrive::lost) ? KvTransferOutcome::lost : KvTransferOutcome::refused;
     if (result.error.empty())
         result.error = result.outcome == KvTransferOutcome::lost ? "K/V payload unusable"
                                                                  : "K/V transfer refused before writing";
@@ -30,7 +33,8 @@ KvTransferResult classify(bool ok, bool sink_refused, bool mutated, uint64_t ver
 }  // namespace
 
 KvTransferResult kv_layer_transfer_run(const KvLayerDriveFn& drive, const KvLayerSink& write) {
-    if (!drive || !write) return classify(false, false, false, 0, "K/V transfer has no source or no destination");
+    if (!drive || !write)
+        return classify(KvDrive::refused, false, false, 0, "K/V transfer has no source or no destination");
     bool sink_refused = false;
     bool mutated = false;
     uint64_t verified = 0;
@@ -46,7 +50,7 @@ KvTransferResult kv_layer_transfer_run(const KvLayerDriveFn& drive, const KvLaye
     };
     std::string error;
     const KvDrive drove = drive(checked, error);
-    return classify(drove == KvDrive::ok, sink_refused, mutated, verified, error);
+    return classify(drove, sink_refused, mutated, verified, error);
 }
 
 KvTransferResult kv_transfer_run(const KvTransfer& transfer) {
@@ -74,14 +78,7 @@ KvTransferResult kv_transfer_run(const KvTransfer& transfer) {
         return true;
     };
     const KvDrive drove = transfer.drive(checked, error);
-    // A driver that reports loss keeps it; a driver refusal and a sink refusal both mean nothing was written.
-    KvTransferResult finished = classify(drove == KvDrive::ok, sink_refused, result.mutated, result.verified_bytes,
-                                         error);
-    if (!finished.ok && finished.outcome == KvTransferOutcome::refused && drove == KvDrive::lost) {
-        finished.outcome = KvTransferOutcome::lost;
-        finished.error = error.empty() ? "K/V payload unusable" : error;
-    }
-    return finished;
+    return classify(drove, sink_refused, result.mutated, result.verified_bytes, error);
 }
 
 }  // namespace strata::core

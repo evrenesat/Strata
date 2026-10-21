@@ -187,6 +187,20 @@ int main() {
         const auto partial=kv_layer_transfer_run(drive,refusing);
         check(!partial.ok && partial.outcome==KvTransferOutcome::fatal && partial.verified_bytes==kBlock,
               "a later layer's failure keeps the whole restore fatal");
+        // A multi-layer source that reports LOSS before any write is a lost capsule, exactly as the single-layer entry
+        // point classifies it - never a refusal that would be retried.
+        const KvLayerDriveFn losing=[](const KvLayerSink&,std::string& why) {
+            why="spill read failed"; return KvDrive::lost;
+        };
+        const auto lost=kv_layer_transfer_run(losing,sink);
+        check(!lost.ok && lost.outcome==KvTransferOutcome::lost && lost.verified_bytes==0,
+              "a multi-layer source that reports loss before any write is lost, not refused");
+        const KvLayerDriveFn refusing_before=[](const KvLayerSink&,std::string& why) {
+            why="buffers could not be allocated"; return KvDrive::refused;
+        };
+        const auto refused=kv_layer_transfer_run(refusing_before,sink);
+        check(!refused.ok && refused.outcome==KvTransferOutcome::refused,
+              "a multi-layer admission refusal stays a refusal");
     }
     // ---- degenerate transfers -------------------------------------------------------------
     {

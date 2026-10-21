@@ -489,6 +489,25 @@ int main() {
             check(sunk == kSpillBlockBytes && result.verified_bytes == kSpillBlockBytes,
                   "only the verified block reached the sink");
         }
+        // A pass that fails after a successful open still leaves the descriptor with the reader, so a caller can
+        // recover the capsule instead of losing it on an admission or storage refusal.
+        {
+            SpillManifest manifest = make_manifest(29, {{kSpillBlockBytes * 2, 0, 0, 0, 0}});
+            SpillWriter writer;
+            write_capsule(manifest, writer);
+            SpillFile file = writer.release();
+            std::atomic<int> fails{0};
+            const SpillFault failing = [&fails](const char* step) {
+                if (std::strcmp(step, "read") != 0) return 0;
+                return fails.fetch_add(1) == 0 ? EIO : 0;
+            };
+            SpillReader reader = SpillReader::open(std::move(file), manifest, error, failing);
+            check(reader.valid(), "the capsule opens with a failing first read");
+            const auto result = reader.run({});
+            check(!result.ok && !result.admission, "a read failure is a payload failure, not admission");
+            SpillFile back = reader.release_file();
+            check(back.valid(), "the descriptor survives a failed pass");
+        }
         // A corrupted first block reaches no sink at all: nothing was mutated.
         {
             SpillManifest manifest = make_manifest(22, {{kSpillBlockBytes * 2, 0, 0, 0, 0}});

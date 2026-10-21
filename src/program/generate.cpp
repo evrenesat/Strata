@@ -10046,6 +10046,10 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                         // request ends with ONE typed terminal and the outer loop takes the next request.  No
                         // RESUMED, no DONE, no retry, no PCANCEL.
                         parked_id=0; parked_cancelled=false;
+                        // Nothing is parked any more: release the capsule's driver, checkpoints and (already closed)
+                        // capsule file.  Without this the capsule stays occupied, every later VIP preemption is
+                        // refused with `nested_pause`, and possibly hundreds of megabytes stay resident.
+                        parked=strata::program::GenerationCapsule{};
                         std::fprintf(stdout,"R %llu ERR priority_spill_lost\n",(unsigned long long)request_id);
                         std::fflush(stdout);
                         return 3;
