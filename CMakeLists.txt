@@ -123,6 +123,10 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_split_failure_test src/core/conversation_split_failure_test.cpp)
   target_include_directories(conversation_split_failure_test PRIVATE include)
   add_test(NAME conversation_split_failure_test COMMAND conversation_split_failure_test)
+  # the shared K/V layout verdicts: computed and checked without a device
+  add_executable(conversation_kv_layout_test src/core/conversation_kv_layout_test.cpp src/core/conversation_kv_layout.cpp)
+  target_include_directories(conversation_kv_layout_test PRIVATE include "${CMAKE_CURRENT_SOURCE_DIR}/src/core")
+  add_test(NAME conversation_kv_layout_test COMMAND conversation_kv_layout_test)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
@@ -473,7 +477,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+    src/core/conversation_snapshot.cpp src/core/conversation_kv_layout.cpp src/core/conversation_state.cpp
+    src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
     src/program/generation_capsule.cpp src/program/generation_capture.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
