@@ -5,7 +5,9 @@
 #include <sstream>
 
 namespace strata::program {
-enum class ProofFault { none, capture_admission, capture_postcheck, restore_validation, restore_after_main };
+enum class ProofFault { none, capture_admission, capture_postcheck, restore_validation, restore_after_main,
+                        spill_ram_admission, spill_write, spill_truncate, spill_corrupt_first, spill_corrupt_late,
+                        spill_source_copy };
 struct GenerationProof {
     // Bound only by --priority-proof, never request parameters or HTTP.
     ProofFault fault=ProofFault::none;
