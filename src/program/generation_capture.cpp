@@ -486,11 +486,12 @@ GenerationTransfer restore_spill_kv(GenerationCapsule& image,GenerationRuntime& 
         if (restored.detail==core::KvTransferOutcome::fatal) return fatal(runtime,error);
         return restored.detail==core::KvTransferOutcome::lost ? GenerationTransfer::lost : GenerationTransfer::refused;
     }
-    if (!has_draft && !restore_main_resident(error)) return fatal(runtime,error);
+    // Without a draft entry the hook never runs; with one it runs before the draft's first block.  Either way the
+    // main layers' recurrent state is restored exactly once, and only after their K/V is in place.
+    if (!main_restored && !restore_main_resident(error)) return fatal(runtime,error);
     // Main K/V and recurrent state are in place; now the draft layer's working state (its K/V came last in the pass).
     if (has_draft && !runtime.mtp->request_restore_resident(*image.mtp,runtime.session,error))
         return fatal(runtime,error);
-    if (!main_restored) { error="generation capsule main state was not restored"; return fatal(runtime,error); }
     return GenerationTransfer::complete;
 }
 }  // namespace
