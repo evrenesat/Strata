@@ -105,9 +105,13 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(priority_protocol_test src/program/priority_protocol_test.cpp)
   target_include_directories(priority_protocol_test PRIVATE include)
   add_test(NAME priority_protocol_test COMMAND priority_protocol_test)
+  # the capsule now owns an optional anonymous spill file, so the host spill layer (and its block digest) is linked in
+  find_package(Threads REQUIRED)
   add_executable(generation_capsule_test src/program/generation_capsule_test.cpp
-    src/program/generation_capsule.cpp src/spec/suffix_drafter.cpp src/spec/draft_policy.cpp)
+    src/program/generation_capsule.cpp src/spec/suffix_drafter.cpp src/spec/draft_policy.cpp
+    src/core/kv_spill.cpp src/core/conversation_file.cpp)
   target_include_directories(generation_capsule_test PRIVATE include)
+  target_link_libraries(generation_capsule_test PRIVATE Threads::Threads)
   add_test(NAME generation_capsule_test COMMAND generation_capsule_test)
   add_executable(generation_proof_test src/program/generation_proof_test.cpp
     src/spec/suffix_drafter.cpp src/spec/draft_policy.cpp)
