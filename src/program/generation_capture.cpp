@@ -286,6 +286,12 @@ GenerationTransfer capture_spill(GenerationCapsule& out,GenerationDriver& driver
         const bool with_draft=runtime.mtp!=nullptr;
         const int64_t draft=with_draft ? draft_extent(driver,runtime) : 0;
         if (with_draft) {
+            // A drafter that cannot be captured RIGHT NOW (no bound drained serial state: chain live, forced on, not
+            // drained) must refuse this capture, not poison the engine.  capture_ram makes the same pre-check during
+            // its byte estimate; the disk path has to make it separately because request_capture_sources would
+            // otherwise turn the refusal into a readback failure.
+            size_t mtp_bytes=0;
+            if (!runtime.mtp->request_bytes(draft,mtp_bytes,error)) return GenerationTransfer::refused;
             mtp_state.emplace();
             // The resident state and the draft K/V source in one call: the speculative extent (lookahead included) is
             // what gets captured, and the coupled history/q/R/sampling state comes with it.

@@ -185,9 +185,27 @@ ConversationCgroupMemory conversation_cgroup_memory(const std::string& proc_cgro
         }
         return bound;
     };
-    if (v2_path) return walk(root, *v2_path, "/memory.max", "/memory.current", false);
+    // A hybrid host has BOTH lines: a unified tree that does not control memory, and the v1 memory controller.  The
+    // v2 layout only applies when the root really is a v2 mount that controls memory, which its own
+    // `cgroup.controllers` file says.  Otherwise the v1 memory limit is the real one - and reading the v2 path there
+    // finds no file, which reads as "unbounded" and would silently fail open, ignoring the limit that applies.
+    const auto v2_controls_memory = [&]() {
+        std::ifstream controllers(root + "/cgroup.controllers");
+        if (!controllers) return false;
+        std::string listing;
+        while (std::getline(controllers, listing)) {
+            std::istringstream tokens(listing);
+            std::string token;
+            while (tokens >> token)
+                if (token == "memory") return true;
+        }
+        return false;
+    };
+    if (v2_path && (!v1_path || v2_controls_memory()))
+        return walk(root, *v2_path, "/memory.max", "/memory.current", false);
     if (v1_path) return walk(root + "/memory", *v1_path, "/memory.limit_in_bytes",
                              "/memory.usage_in_bytes", true);
+    if (v2_path) return walk(root, *v2_path, "/memory.max", "/memory.current", false);  // unreadable listing
     return {};                                    // no memory controller: the host view alone applies
 }
 

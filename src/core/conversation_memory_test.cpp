@@ -151,6 +151,27 @@ int main() {
         fs::remove(tree.root / "job" / "memory.current", ignored);
         check(!conversation_memory_bound(600, tree.read()), "an unreadable usage fails closed");
     }
+    // Hybrid v1/v2 host: BOTH lines exist, the unified root does not control memory, and the real limit is the v1
+    // one.  Reading the v2 path there finds no file, which must not read as "unbounded".
+    {
+        CgroupTree tree("strata-cgmem-hybrid");
+        tree.write(tree.proc(), "0::/a\n7:memory:/a\n");
+        tree.write(tree.root / "a" / "memory.max", "max\n");          // the unified tree's (irrelevant) view
+        tree.write(tree.root / "a" / "memory.current", "0\n");
+        tree.write(tree.root / "memory" / "a" / "memory.limit_in_bytes", "5000\n");
+        tree.write(tree.root / "memory" / "a" / "memory.usage_in_bytes", "1200\n");
+        const auto bound = tree.read();
+        check(bound.present && bound.available == 3800, "a hybrid host uses its v1 memory limit, not the unified tree");
+        check(conversation_memory_bound(1ULL << 40, bound) == 3800, "the v1 bound is what admission sees");
+        // The same host, once the unified root really does control memory: the v2 view wins.
+        tree.write(tree.root / "cgroup.controllers", "cpu io memory pids\n");
+        tree.write(tree.root / "a" / "memory.max", "1000\n");
+        tree.write(tree.root / "a" / "memory.current", "400\n");
+        check(tree.read().available == 600, "a v2 root that controls memory is preferred");
+        // ...but a root listing only other controllers is not a memory-capable v2 root.
+        tree.write(tree.root / "cgroup.controllers", "cpu io pids\n");
+        check(tree.read().available == 3800, "a unified root without memory in cgroup.controllers is not the bound");
+    }
     // v1 fallback: the memory controller hierarchy under <root>/memory.
     {
         CgroupTree tree("strata-cgmem-v1");
