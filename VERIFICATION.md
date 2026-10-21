@@ -23,7 +23,8 @@ repository plus one GPU host.
 | `serve/test_priority_protocol.py` | PGEN/PPAUSE/PRESUME/PCANCEL framing, PAUSED/RESUMED/PREFUSED handling, BLOCK-before-ACK ordering |
 | `serve/test_priority_stream.py` | SSE keep-alive/status comments, parser continuity across a pause |
 | `serve/test_priority_auth.py` | role file validation, constant-time matching, endpoint allowlist, malformed entries fail startup |
-| `generation_capsule_test`, `conversation_*_test` (C++) | capsule ownership/lifetimes, memory admission incl. cgroup v2/v1 bounds, snapshot validation refusals |
+| `generation_capsule_test`, `conversation_*_test` (C++) | capsule ownership/lifetimes, memory admission incl. cgroup v2/v1 bounds (and the reclaimable-file-cache credit), snapshot validation refusals |
+| `kv_spill_test` (C++, host-only) | anonymous capsule storage: pinned directory checks, manifest arithmetic and revalidation, streaming writer with per-block digests and writeback windows, the two-buffer verified reader, injected I/O faults, move/close lifetimes |
 
 ## GPU scenario matrix (the real evidence)
 
@@ -72,3 +73,57 @@ never a retry-until-pass), original service restored after isolated runs.
   under repeated parking (single data point at 121 KB prompt so far).
 - Native pause with pending UTF-8 bytes was never observed; covered by
   deterministic tokenizer/parser-identity tests only.
+
+## Parked-capsule spill (opt-in, server side)
+
+The parked capsule holds the suspended request's K/V.  Its disk fallback writes that K/V to ONE anonymous temporary
+file when RAM admission refuses it, so the queued VIP can run instead of the background request being lost, and reads
+it back verified before any live state is touched.  The RAM capsule stays the default path.
+
+Configuration lives in the config's `priority` section and is validated by the server before anything is spawned:
+
+| Key | Meaning |
+|---|---|
+| `spill_dir` | absolute directory for the capsule file.  Must exist (or be creatable as the final missing component), be owned by this process, have mode `0700`, and sit on ext4, XFS or Btrfs |
+| `spill_mode` | `off` (default without a directory), `fallback` (default with one: try RAM first), `always` (**testing only**: skip the RAM attempt but keep every real memory, disk and time check) |
+| `spill_min_free_mib` | the extra free space required beyond the payload, in MiB (default 4096; `0` removes only the extra reserve, never the payload requirement) |
+
+Spill is never enabled by installing a capable binary: it needs both a directory and a serving mode other than `off`.
+A spill-enabled start requires the engine to advertise `priority_spill=1` after READY on **every** start, including a
+restart or a lazy reload; an engine without it is refused (`priority spill requires an engine that advertises
+priority_spill=1`).  `always` prints a testing-only warning at startup.
+
+This repository's server implements and tests the configuration, the capability handshake, the `PAUSED ... spill=1`
+capability token and the typed loss (`ERR priority_spill_lost` becomes a `priority_spill_lost` stream error on Chat
+Completions, Responses and Anthropic).  **The engine-side capsule spill is not in this tree yet**: a spill-enabled
+start is therefore refused against the current engine, which is the correct fail-closed behaviour rather than a silent
+half-feature.
+
+### Containers
+
+The capsule file is an `O_TMPFILE` inode, so it has no name, nothing to sweep and nothing left behind after a crash -
+but it does need a real Linux filesystem under it.  A container must bind-mount a directory from ext4, XFS or Btrfs
+storage whose owner and mode (0700) are correct **as seen inside the container**; tmpfs, ramfs, network and FUSE
+filesystems are refused at startup, and the container's own overlayfs writable layer is not supported.  Naming a
+Docker volume does not prove its backing filesystem - check the mounted directory from inside the container.
+
+### Policies worth knowing
+
+- **Capture has a publish budget of 60 seconds** from the moment the pause is accepted; a capsule whose estimated
+  write would exceed it is refused *before* any disk write and the background keeps running.  A blocked syscall can
+  still exceed the deadline, and the engine's existing watchdog covers that case.
+- **Writes are buffered and written back every 64 MiB** (`sync_file_range` then `posix_fadvise`), and the final tail
+  is flushed before the capsule is published, so captured bytes do not pile up as dirty page cache.
+- **The write counter is logical bytes**, including partial writes of attempts that were later refused.  It is not a
+  measure of physical device writes, and it is not framed as drive wear.
+- **Corruption handling is one-pass**: every block is verified against its digest before it is used, and any recovery
+  decision happens before the first live write.  A fault discovered *after* live state was written is fatal rather
+  than recoverable, because there is no safe way to un-restore a half-written engine.  These digests detect
+  accidental corruption; they are not a tamper check and closing the file is not secure erasure.
+- **Measured memory, not assumptions**: capture is expected to add one 16 MiB staging block, restore two 16 MiB
+  buffers plus a small reader allowance, and each writeback window at most 64 MiB.  Verification measures anonymous,
+  dirty and writeback deltas per phase against those bounds instead of asserting throughput from the design.
+
+Verification status: the host-side pieces above are covered by the CPU suites in this file.  The GPU/operational
+matrix for actual spills (a 245,760-token request with five forced park/restore cycles, a real capacity refusal, the
+fault cases and cleanup) requires the engine side and is **not yet executed**.
