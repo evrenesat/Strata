@@ -132,6 +132,10 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   # the parked-capsule disk fallback: anonymous file, manifest and the bounded two-buffer reader.  It reuses the file
   # layer's block digest, so conversation_file.cpp is linked in, and the reader needs one thread.
   find_package(Threads REQUIRED)
+  # the capture-time policy: the prediction, the budget verdict and the progress gate (header-only)
+  add_executable(spill_policy_test src/core/spill_policy_test.cpp)
+  target_include_directories(spill_policy_test PRIVATE include)
+  add_test(NAME spill_policy_test COMMAND spill_policy_test)
   add_executable(kv_spill_test src/core/kv_spill_test.cpp src/core/kv_spill.cpp src/core/conversation_file.cpp)
   target_include_directories(kv_spill_test PRIVATE include)
   target_link_libraries(kv_spill_test PRIVATE Threads::Threads)
