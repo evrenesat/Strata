@@ -1,13 +1,27 @@
 #include "strata/program/generation_proof.hpp"
 #include <cstdio>
+#include <string>
+#include <utility>
 #include <cstdlib>
 using namespace strata::program;
-void check(bool v) { if(!v) std::exit(1); }
+int checks=0;
+void check(bool v) { ++checks; if(!v) { std::fprintf(stderr,"FAIL\n"); std::exit(1); } }
 int main() {
     ProofCommand c;
     check(proof_command("PTEST RESET",c) && c.kind==ProofCommand::reset);
     check(proof_command("PTEST FAULT 7 restore_after_main",c) && c.id==7 && c.injection==ProofFault::restore_after_main);
     check(proof_command("PTEST PAUSE 2 prefill 245759",c) && c.minimum==245759);
+    // The parked-capsule disk faults are armed by the same trusted control line.
+    for(const auto& [name,fault]:std::initializer_list<std::pair<const char*,ProofFault>>{
+            {"spill_ram_admission",ProofFault::spill_ram_admission},
+            {"spill_write",ProofFault::spill_write},{"spill_truncate",ProofFault::spill_truncate},
+            {"spill_corrupt_first",ProofFault::spill_corrupt_first},
+            {"spill_corrupt_late",ProofFault::spill_corrupt_late},
+            {"spill_source_copy",ProofFault::spill_source_copy}}) {
+        const std::string line=std::string("PTEST FAULT 9 ")+name;
+        const bool parsed=proof_command(line,c) && c.kind==ProofCommand::fault && c.id==9 && c.injection==fault;
+        if(!parsed) { std::fprintf(stderr,"FAIL: %s\n",name); std::exit(1); }
+    }
     for(const char* bad:{"PTEST FAULT 0 capture_admission","PTEST FAULT +1 capture_postcheck",
         "PTEST FAULT 9223372036854775808 restore_validation","PTEST RESET extra",
         "PTEST PAUSE 1 decode -1","PTEST FAULT 1 unknown","PTEST PAUSE 1 decode 1 extra"})

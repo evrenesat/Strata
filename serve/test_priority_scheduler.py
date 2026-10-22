@@ -454,4 +454,97 @@ class SchedulerTests(unittest.TestCase):
                 PriorityScheduler(lambda _: None, timer=False, **kwargs)
 
 
+
+class SpillSchedulerTests(unittest.TestCase):
+    """The parked-capsule disk fallback's protocol surface in the scheduler: capability tokens on PAUSED, where the
+    parked request lives, and the one typed lost-terminal that ends a request without a retry or a cancellation."""
+    def setUp(self):
+        self.clock, self.sent = Clock(), []
+        self.s = PriorityScheduler(self.sent.append, clock=self.clock, timer=False)
+    def bg(self): return self.s.submit('GEN 100 seed=424242 1,2,3')
+    def fg(self): return self.s.submit('GEN 10 4,5', Role.HERMES)
+    def done(self, r): self.s.feed(f'R {r.id} DONE 2 {r.prompt_tokens} 1 1 stop 0 0 0')
+    def pause(self, r, options=''):
+        self.s.feed(f'PAUSED {r.id} decode 3 1{(" " + options) if options else ""}')
+    def test_spill_token_marks_the_park_and_the_snapshot(self):
+        b = self.bg(); h = self.fg(); self.pause(b, 'spill=1')
+        self.assertTrue(b.spilled)
+        self.assertEqual(self.s.parked, b.id)
+        self.assertTrue(self.s.snapshot()['parked_on_disk'])
+        self.assertIn((self.clock(), 'parked_on_disk', b.id, 'spill'), self.s.protocol_evidence)
+        self.done(h)
+        self.clock.advance(300); self.s.tick()
+        self.assertEqual(self.sent[-1], 'PRESUME 1')
+        self.assertTrue(self.s.snapshot()['parked_on_disk'])   # still on disk until the engine says RESUMED
+        self.s.feed(f'RESUMED {b.id}')
+        self.assertFalse(b.spilled)                       # resident again
+        self.assertFalse(self.s.snapshot()['parked_on_disk'])
+    def test_both_capability_tokens_are_accepted_in_either_order(self):
+        for options in ('backfill=0 spill=1', 'spill=1 backfill=0'):
+            s = PriorityScheduler(lambda _: None, clock=self.clock, timer=False)
+            b = s.submit('GEN 100 seed=424242 1,2,3'); s.submit('GEN 10 4,5', Role.HERMES)
+            s.feed(f'PAUSED {b.id} decode 3 1 {options}')
+            self.assertIsNone(s.dead, options)
+            self.assertTrue(b.spilled, options)
+            self.assertEqual(s.backfill_disabled_until, s.lease_until, options)
+    def test_bad_capability_tokens_are_protocol_errors(self):
+        for options in ('spill=1 spill=1', 'backfill=0 backfill=0', 'spill=1 backfill=1', 'spill=0',
+                        'spilled=1', 'spill', 'spill=1 extra=2'):
+            s = PriorityScheduler(lambda _: None, clock=self.clock, timer=False)
+            b = s.submit('GEN 100 seed=424242 1,2,3'); s.submit('GEN 10 4,5', Role.HERMES)
+            s.feed(f'PAUSED {b.id} decode 3 1 {options}')
+            self.assertIsInstance(s.dead, PriorityProtocolError, options)
+    def test_a_disk_park_without_the_token_stays_in_ram(self):
+        b = self.bg(); self.fg(); self.pause(b)
+        self.assertFalse(b.spilled)
+        self.assertFalse(self.s.snapshot()['parked_on_disk'])
+        self.assertFalse(any(e[1] == 'parked_on_disk' for e in self.s.protocol_evidence))
+    def test_lost_capsule_ends_the_resume_with_one_terminal_and_frees_ownership(self):
+        b = self.bg(); h = self.fg(); self.pause(b, 'spill=1'); self.done(h)
+        self.clock.advance(300); self.s.tick()
+        self.assertEqual(self.sent[-1], 'PRESUME 1')
+        self.s.feed(f'R {b.id} ERR priority_spill_lost')
+        self.assertEqual(b.state, 'done')
+        self.assertEqual(b.terminal, 'ERR priority_spill_lost')
+        self.assertIsNone(self.s.active); self.assertIsNone(self.s.parked)
+        self.assertFalse(b.spilled)
+        self.assertFalse(self.s.snapshot()['parked_on_disk'])
+        self.assertIsNone(self.s.dead)                    # a handled loss is not a protocol failure
+        self.assertEqual([e for e in self.sent if e.startswith('PCANCEL')], [])
+        self.assertEqual([e for e in self.sent if e.startswith('PRESUME')], ['PRESUME 1'])
+    def test_a_new_request_and_another_park_work_after_a_lost_capsule(self):
+        b = self.bg(); h = self.fg(); self.pause(b, 'spill=1'); self.done(h)
+        self.clock.advance(300); self.s.tick()
+        self.s.feed(f'R {b.id} ERR priority_spill_lost')
+        self.s.release(b)
+        b2 = self.s.submit('GEN 100 seed=424242 1,2,3')
+        self.assertEqual(self.s.active, b2.id)            # dispatched again with nothing parked
+        h2 = self.fg(); self.pause(b2, 'spill=1')
+        self.assertEqual(self.s.parked, b2.id)
+        self.assertTrue(self.s.snapshot()['parked_on_disk'])
+        self.done(h2); self.assertIsNone(self.s.dead)
+    def test_late_pause_after_an_unadmitted_vip_still_resumes_the_background(self):
+        b = self.bg(); vip = self.fg()                    # the VIP is queued; its pause is in flight
+        self.assertEqual(self.sent, ['PGEN 1 100 seed=424242 1,2,3', 'PPAUSE 1'])
+        # The VIP's reservation times out and its release drops it; the pause acknowledgement arrives afterwards.
+        self.s.cancel(vip); self.clock.advance(0.5)
+        self.pause(b, 'spill=1')
+        self.assertLessEqual(self.s.lease_until, self.clock())   # the unadmitted lease protected nobody
+        self.assertEqual(b.state, 'resuming')             # so the late PAUSED resumes the background at once
+        self.assertEqual(self.sent[-1], 'PRESUME 1')
+    def test_admitted_vip_lease_survives_a_late_pause(self):
+        b = self.bg()
+        turn = self.s.begin_turn(arrival=0)
+        vip = self.s.submit('GEN 10 4,5', Role.HERMES, arrival=0, turn=turn)
+        self.s.feed('PAUSED 1 decode 3 1 spill=1')
+        self.assertEqual(b.state, 'parked')
+        self.assertEqual(self.s.lease_until, 300)         # this lease admitted a foreground request
+        self.assertEqual(self.sent[-1], "PGEN 2 10 4,5")      # the VIP runs while the background is parked
+        self.done(vip); self.s.end_turn(turn)
+        self.clock.advance(1); self.s.tick()
+        self.assertNotIn('PRESUME 1', self.sent)          # the admitted lease keeps the park until it lapses
+        self.clock.advance(299); self.s.tick()
+        self.assertEqual(self.sent[-1], 'PRESUME 1')
+        self.s.release(vip)
+
 if __name__=='__main__': unittest.main()

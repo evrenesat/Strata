@@ -59,7 +59,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.priority_scheduler import (PriorityScheduler, Role, PriorityProtocolError,  # noqa: E402
-                                      PriorityUnavailable, PriorityQueueFull)
+                                      PriorityUnavailable, PriorityQueueFull, PrioritySpillLost)
 from serve.priority_auth import configured_auth, validate_chat  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -637,6 +637,7 @@ class StrataEngine:
                  env: dict | None = None, lazy: bool = False,
                  priority_queue_limits: tuple[int, int] | None = None,
                  priority_resume_retry_deadline_seconds: int | None = None,
+                 priority_spill: dict | None = None,
                  silence_s: float | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.priority_configured = '--priority-serving' in args
@@ -647,6 +648,9 @@ class StrataEngine:
         # values immediately; restart() keeps them because they live on self.
         self.priority_queue_limits = priority_queue_limits or (64, 8 * 1024 * 1024)
         self.priority_resume_retry_deadline_seconds = priority_resume_retry_deadline_seconds
+        # Enabled spill settings (validated before construction) or None: a serving engine must advertise the
+        # capability on THIS start, including every restart and lazy reload.
+        self.priority_spill = priority_spill if priority_spill and priority_spill.get('enabled') else None
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -785,6 +789,9 @@ class StrataEngine:
             if self.batch or self.info.get('priority_protocol') != 1:
                 self.close()
                 raise ValueError('priority mode requires the matching serial native protocol')
+            if self.priority_spill and self.info.get('priority_spill') != 1:
+                self.close()
+                raise ValueError('priority spill requires an engine that advertises priority_spill=1 after READY')
             owned_proc=self.proc
             limits = self.priority_queue_limits
             deadline = self.priority_resume_retry_deadline_seconds
@@ -911,6 +918,7 @@ class StrataEngine:
         # The priority bounds live on self so a plain restart() keeps them; __init__ would
         # otherwise reset them to the defaults on the re-run below.
         priority_limits, priority_deadline = self.priority_queue_limits, self.priority_resume_retry_deadline_seconds
+        restart_spill = self.priority_spill
         restart_silence = self.silence_s
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
@@ -923,7 +931,7 @@ class StrataEngine:
                 try:
                     self.__init__(*self.spawn, priority_queue_limits=priority_limits,
                                   priority_resume_retry_deadline_seconds=priority_deadline,
-                                  silence_s=restart_silence)
+                                  priority_spill=restart_spill, silence_s=restart_silence)
                     break
                 except RuntimeError:
                     try:
@@ -1619,7 +1627,13 @@ class StrataEngine:
                     break
                 elif line.startswith('ERR '):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    code = line[4:].strip()
+                    if code == PrioritySpillLost.code:
+                        # The engine lost the parked capsule before restoring any live state: one typed terminal for
+                        # this response, no retry, no cancellation, no RESUMED.  The request is gone from the engine.
+                        raise PrioritySpillLost(f'{code}: the parked request was lost before its state was restored; '
+                                                'a new request may be sent')
+                    raise ValueError(code)
                 elif line.startswith('PP '):
                     fields = line.split()
                     self.progress = int(fields[1]), int(fields[2])
@@ -2260,6 +2274,91 @@ def priority_queue_limits(cfg: dict) -> tuple[int, int]:
     return counts, bytes_
 
 
+PRIORITY_SPILL_MODES = ('off', 'fallback', 'always')
+PRIORITY_SPILL_MIN_FREE_MIB = 4096                      # the engine's own default reserve
+PRIORITY_SPILL_MAX_MIN_FREE_MIB = 2**63 // 1048576      # INT64_MAX / 1 MiB: the engine's bound, rounded down
+PRIORITY_SPILL_FLAGS = ('--priority-spill-dir', '--priority-spill-mode', '--priority-spill-min-free-mib')
+
+
+def priority_spill_settings(cfg: dict) -> dict:
+    """The parked-capsule disk fallback (the priority section's spill_dir / spill_mode / spill_min_free_mib), validated
+    before anything is spawned: {"enabled", "dir", "mode", "min_free_mib"}.  Spill is opt-in and never enabled by
+    installing a capable engine: it needs BOTH a configured absolute directory and a serving mode other than "off".
+    An explicit "off" may keep a directory configured but must not create, probe or require anything, and orphan
+    mode/minimum settings without a directory are refused.  The three native flags belong to this section alone, so a
+    hand-written --priority-spill-* in "args" is refused rather than silently duplicated."""
+    priority = cfg.get('priority')
+    if priority is None:
+        return {'enabled': False, 'dir': None, 'mode': 'off', 'min_free_mib': PRIORITY_SPILL_MIN_FREE_MIB}
+    if not isinstance(priority, dict):
+        raise ValueError('priority must be an object')
+    raw = cfg.get('args')
+    if isinstance(raw, (list, tuple)) and any(str(a).startswith('--priority-spill') for a in raw):
+        raise ValueError('"priority"."spill_*" settings own the spill flags; remove them from "args"')
+    directory = priority.get('spill_dir')
+    mode = priority.get('spill_mode')
+    minimum = priority.get('spill_min_free_mib')
+    if mode is not None and (isinstance(mode, bool) or not isinstance(mode, str) or mode not in PRIORITY_SPILL_MODES):
+        raise ValueError(f'"priority"."spill_mode" must be one of off, fallback, always, not {mode!r}')
+    if directory is not None:
+        if not isinstance(directory, str) or not directory or not os.path.isabs(directory):
+            raise ValueError(f'"priority"."spill_dir" must be an absolute directory path, not {directory!r}')
+        if '\x00' in directory:
+            raise ValueError('"priority"."spill_dir" must not contain NUL')
+    if minimum is not None and (isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0
+                                or minimum > PRIORITY_SPILL_MAX_MIN_FREE_MIB):
+        raise ValueError('"priority"."spill_min_free_mib" must be a whole number of MiB '
+                         f'0..{PRIORITY_SPILL_MAX_MIN_FREE_MIB}, not {minimum!r}')
+    effective = mode if mode is not None else ('fallback' if directory is not None else 'off')
+    if directory is None and effective != 'off':
+        raise ValueError('"priority"."spill_mode" needs a "priority"."spill_dir"')
+    if directory is None and minimum is not None:
+        raise ValueError('"priority"."spill_min_free_mib" needs a "priority"."spill_dir"')
+    return {'enabled': directory is not None and effective != 'off', 'dir': directory, 'mode': effective,
+            'min_free_mib': PRIORITY_SPILL_MIN_FREE_MIB if minimum is None else minimum}
+
+
+def prepare_spill_directory(path: str) -> None:
+    """Validate the spill directory before the engine starts, creating only the final missing component with mode 0700
+    when its parent already exists.  It never chmods or chowns an existing path, never creates parent trees, and
+    refuses a symbolic link at any component: the engine repeats the ownership, mode, no-follow and filesystem checks
+    on the descriptor it pins, but a bad path must fail the start rather than the first park."""
+    if os.name != 'posix':
+        raise ValueError('priority spill storage is only supported on Linux')
+    if not isinstance(path, str) or not os.path.isabs(path):
+        raise ValueError(f'spill directory must be an absolute path, not {path!r}')
+    parts = [part for part in path.split(os.sep) if part]
+    if not parts:
+        raise ValueError('spill directory must not be the filesystem root')
+    if any(part in ('.', '..') for part in parts):
+        raise ValueError('spill directory must not contain "." or ".." components')
+    current = os.sep
+    for index, part in enumerate(parts):
+        current = os.path.join(current, part)
+        try:
+            stat_ = os.lstat(current)
+        except FileNotFoundError:
+            if index != len(parts) - 1:
+                raise ValueError(f'spill directory parent is missing: {current!r}') from None
+            try:
+                os.mkdir(current, 0o700)
+            except OSError as error:
+                raise ValueError(f'spill directory cannot be created: {error.strerror}') from None
+            stat_ = os.lstat(current)
+        except OSError as error:
+            raise ValueError(f'spill directory cannot be inspected: {error.strerror}') from None
+        if stat_.st_mode & 0o170000 == 0o120000:
+            raise ValueError(f'spill directory component is a symbolic link: {current!r}')
+        if index != len(parts) - 1:
+            continue
+        if not (stat_.st_mode & 0o170000 == 0o040000):
+            raise ValueError(f'spill directory is not a directory: {current!r}')
+        if stat_.st_uid != os.geteuid():
+            raise ValueError(f'spill directory is not owned by this process: {current!r}')
+        if stat_.st_mode & 0o7777 != 0o700:
+            raise ValueError(f'spill directory must have mode 0700: {current!r}')
+
+
 def layer_split_value(cfg: dict) -> str:
     """#644: the config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
     each later GPU's share - one rising number per GPU after the first, e.g. "24,36,42" for 4 GPUs (layers 0-23 on the
@@ -2329,6 +2428,17 @@ def engine_args(cfg: dict) -> list[str]:
             raise ValueError('priority requires a serial single-GPU engine')
         if '--priority-serving' not in args:
             args.append('--priority-serving')
+    spill = priority_spill_settings(cfg)
+    if spill['enabled']:
+        if '--priority-serving' not in args:
+            raise ValueError('priority spill requires priority serving')
+        if any(k in args for k in PRIORITY_SPILL_FLAGS):
+            raise ValueError('duplicate native spill flags')
+        if spill['mode'] == 'always':
+            print('[strata] "priority"."spill_mode": "always" is a TESTING-ONLY override: every park is written to '
+                  'disk even when RAM would hold it; never use it for production serving', flush=True)
+        args += ['--priority-spill-dir', spill['dir'], '--priority-spill-mode', spill['mode'],
+                 '--priority-spill-min-free-mib', str(spill['min_free_mib'])]
     return learned_profile_args(cfg, args)
 
 
@@ -3216,7 +3326,14 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        scheduler = getattr(self.engine, "priority", None)
+        priority_live = None
+        if scheduler is not None:
+            snap = scheduler.snapshot()
+            priority_live = {"parked": snap.get("parked"), "parked_on_disk": bool(snap.get("parked_on_disk")),
+                             "lease_until": snap.get("lease_until"), "backfill": snap.get("backfill")}
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+                **({"priority": priority_live} if priority_live is not None else {}),
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -5855,11 +5972,15 @@ def main() -> int:
             # Both priority bounds are read before construction so the scheduler a non-lazy
             # startup creates immediately sees the configured values.
             queue_limits, resume_deadline = priority_queue_limits(cfg), priority_resume_retry_deadline(cfg)
+            spill = priority_spill_settings(cfg)
+            if spill['enabled']:
+                prepare_spill_directory(spill['dir'])   # before the (minutes-long) start, never the first park
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy, priority_queue_limits=queue_limits,
-                              priority_resume_retry_deadline_seconds=resume_deadline, silence_s=silence)
+                              priority_resume_retry_deadline_seconds=resume_deadline, priority_spill=spill,
+                              silence_s=silence)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
