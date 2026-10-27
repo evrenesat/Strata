@@ -129,12 +129,39 @@ option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
+  add_executable(priority_protocol_test src/program/priority_protocol_test.cpp)
+  target_include_directories(priority_protocol_test PRIVATE include)
+  add_test(NAME priority_protocol_test COMMAND priority_protocol_test)
+  # the capsule now owns an optional anonymous spill file, so the host spill layer (and its block digest) is linked in
+  find_package(Threads REQUIRED)
+  add_executable(generation_capsule_test src/program/generation_capsule_test.cpp
+    src/program/generation_capsule.cpp src/spec/suffix_drafter.cpp src/spec/draft_policy.cpp
+    src/core/kv_spill.cpp src/core/conversation_file.cpp)
+  target_include_directories(generation_capsule_test PRIVATE include)
+  target_link_libraries(generation_capsule_test PRIVATE Threads::Threads)
+  add_test(NAME generation_capsule_test COMMAND generation_capsule_test)
+  add_executable(generation_proof_test src/program/generation_proof_test.cpp
+    src/spec/suffix_drafter.cpp src/spec/draft_policy.cpp)
+  target_include_directories(generation_proof_test PRIVATE include)
+  add_test(NAME generation_proof_test COMMAND generation_proof_test)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
   add_executable(conversation_split_failure_test src/core/conversation_split_failure_test.cpp)
   target_include_directories(conversation_split_failure_test PRIVATE include)
   add_test(NAME conversation_split_failure_test COMMAND conversation_split_failure_test)
+  # the spill memory budget and disk preflight (header-only arithmetic)
+  add_executable(spill_budget_test src/core/spill_budget_test.cpp)
+  target_include_directories(spill_budget_test PRIVATE include)
+  add_test(NAME spill_budget_test COMMAND spill_budget_test)
+  # the restore transaction's rules: ordering, the mutation boundary and the outcome classification
+  add_executable(kv_transfer_test src/core/kv_transfer_test.cpp src/core/kv_transfer.cpp)
+  target_include_directories(kv_transfer_test PRIVATE include)
+  add_test(NAME kv_transfer_test COMMAND kv_transfer_test)
+  # the shared K/V layout verdicts: computed and checked without a device
+  add_executable(conversation_kv_layout_test src/core/conversation_kv_layout_test.cpp src/core/conversation_kv_layout.cpp)
+  target_include_directories(conversation_kv_layout_test PRIVATE include "${CMAKE_CURRENT_SOURCE_DIR}/src/core")
+  add_test(NAME conversation_kv_layout_test COMMAND conversation_kv_layout_test)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
@@ -144,6 +171,18 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # the parked-capsule disk fallback: anonymous file, manifest and the bounded two-buffer reader.  It reuses the file
+  # layer's block digest, so conversation_file.cpp is linked in, and the reader needs one thread.
+  find_package(Threads REQUIRED)
+  # the capture-time policy: the prediction, the budget verdict and the progress gate (header-only)
+  add_executable(spill_policy_test src/core/spill_policy_test.cpp)
+  target_include_directories(spill_policy_test PRIVATE include)
+  add_test(NAME spill_policy_test COMMAND spill_policy_test)
+  add_executable(kv_spill_test src/core/kv_spill_test.cpp src/core/kv_spill.cpp src/core/conversation_file.cpp)
+  target_include_directories(kv_spill_test PRIVATE include)
+  target_link_libraries(kv_spill_test PRIVATE Threads::Threads)
+  add_test(NAME kv_spill_test COMMAND kv_spill_test)
+  set_tests_properties(kv_spill_test PROPERTIES TIMEOUT 300)
 endif()
 
 if(STRATA_HIP_GFX906)
@@ -583,8 +622,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
-    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/conversation_snapshot.cpp src/core/conversation_kv_layout.cpp src/core/kv_transfer.cpp
+    src/core/conversation_state.cpp
+    src/core/conversation_memory.cpp src/core/peer_experts.cpp
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/kv_spill.cpp
+    src/program/generation_capsule.cpp src/program/generation_capture.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -682,6 +724,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(expert_cache_slot_guard_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
+    add_executable(generation_capture_validation_test src/program/generation_capture_validation_test.cpp)
+    target_link_libraries(generation_capture_validation_test PRIVATE strata_engine)
+    add_test(NAME generation_capture_validation_test COMMAND generation_capture_validation_test)
+    set_tests_properties(generation_capture_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
     target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
     add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
@@ -1540,6 +1586,9 @@ endif()
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
             src/spec/draft_source.cpp)
 target_include_directories(strata_spec PUBLIC include)
+if(TARGET strata_engine)
+  target_link_libraries(strata_engine PUBLIC strata_spec)
+endif()
 if(STRATA_BUILD_TESTS)
   add_executable(arch_defaults_test src/core/arch_defaults_test.cpp src/core/arch_defaults.cpp)
   target_include_directories(arch_defaults_test PRIVATE include)

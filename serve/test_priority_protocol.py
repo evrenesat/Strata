@@ -1,0 +1,598 @@
+"""Real StrataEngine pipe reader against a bounded synthetic engine, no GPU."""
+import json
+from pathlib import Path
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+import threading
+import time
+import unittest
+from serve.priority_scheduler import (Role, PriorityScheduler, PriorityUnavailable, PriorityProtocolError,
+                                      PriorityQueueFull, PrioritySpillLost)
+from serve.test_priority_scheduler import Clock
+from serve.server import (StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer,
+                          EngineDied, Role, serve, priority_spill_settings, prepare_spill_directory)
+from serve.frontend import ChatTemplate
+
+FAKE_PRIORITY = r'''
+import json,queue,sys,threading,time
+args=sys.argv[1:]
+reply=json.loads(open(args[args.index('--reply')+1]).read())
+log=open(args[args.index('--events')+1],'a')
+priority='--priority-serving' in args
+spill='--spill' in args
+spill_lost='--spill-lost' in args
+print('INFO engine=fake priority_protocol=1 priority_backfill=1'+(' priority_spill=1' if spill else ''),flush=True)
+print('READY 262144 stop',flush=True)
+q=queue.Queue()
+def reader():
+    for line in sys.stdin:q.put(line.strip())
+    q.put('QUIT')
+threading.Thread(target=reader,daemon=True).start()
+active=parked=None
+def terminal(r,finish='stop'):
+    print(('R %d '%r['id'] if priority else '')+f"DONE {r['at']} {r['prompt']} 1 1 {finish} 0 0 0",flush=True)
+while True:
+    try:line=q.get(timeout=.004 if active else None)
+    except queue.Empty:line=''
+    if line:
+        log.write(line.split(' ',2)[0]+' '+line.split(' ',2)[1]+'\n' if ' ' in line else line+'\n');log.flush()
+    if line=='QUIT':break
+    if line.startswith(('PGEN ','PGENI ','GEN ','GENI ')):
+        assert active is None
+        fields=line.split();rid=int(fields[1]) if priority else 0
+        payload=list(b'HERMES')+[257] if priority and rid%2==0 else reply
+        active=dict(id=rid,at=0,tokens=payload,prompt=len(fields[-1].split(',')),limit=int(fields[2 if priority else 1]))
+    elif line.startswith('PPAUSE '):
+        if not active or active['id']!=int(line.split()[1]):
+            print(f"PREFUSED {line.split()[1]} inactive_request",flush=True)
+        else:
+            print(f"R {active['id']} BLOCK state_transfer 180",flush=True)
+            parked,active=active,None
+            print(f"PAUSED {parked['id']} decode {parked['prompt']-1+parked['at']} {parked['at']}"
+                  + (' spill=1' if spill else ''),flush=True)
+    elif line.startswith('PRESUME '):
+        assert not active and parked and parked['id']==int(line.split()[1])
+        print(f"R {parked['id']} BLOCK state_transfer 180",flush=True)
+        if spill and spill_lost:
+            # The capsule is gone: one typed terminal, no RESUMED, no tokens, and the request is dropped.
+            print(f"R {parked['id']} ERR priority_spill_lost",flush=True)
+            parked=None
+        else:
+            active,parked=parked,None
+            print(f"RESUMED {active['id']}",flush=True)
+    elif line.startswith('PCANCEL '):
+        rid=int(line.split()[1])
+        if active and active['id']==rid:terminal(active,'cancel');active=None
+        elif parked and parked['id']==rid:terminal(parked,'cancel');parked=None
+        else:print(f"PREFUSED {rid} inactive_request",flush=True)
+    elif line=='STOP':
+        if active:terminal(active,'cancel');active=None
+    if active:
+        t=active['tokens'][active['at']];active['at']+=1
+        print(('R %d '%active['id'] if priority else '')+f'T {t}',flush=True)
+        if t==257 or active['at']>=active['limit']:terminal(active);active=None
+'''
+
+
+class PipeFixture(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory()
+        root=Path(self.tmp.name)
+        self.script,self.reply,self.events=root/'engine.py',root/'reply.json',root/'events'
+        self.script.write_text('#!'+sys.executable+'\n'+FAKE_PRIORITY)
+        self.script.chmod(0o700)
+        self.engine=None
+    def start(self, payload=b'background response',priority=True,lazy=False,spill=False,spill_lost=False,
+              spill_config=None):
+        self.reply.write_text(json.dumps(list(payload)+[257]))
+        args=['--reply',str(self.reply),'--events',str(self.events)]
+        if priority:args+=['--priority-serving']
+        if spill:args+=['--spill']
+        if spill_lost:args+=['--spill-lost']
+        self.engine=StrataEngine(str(self.script),args,lazy=lazy,priority_spill=spill_config)
+        return self.engine
+    def tearDown(self):
+        if self.engine:self.engine.close()
+        self.tmp.cleanup()
+    def wait(self,predicate,timeout=3):
+        end=time.monotonic()+timeout
+        while not predicate() and time.monotonic()<end:time.sleep(.001)
+        self.assertTrue(predicate(),'bounded fixture timed out')
+
+
+class ProtocolTests(PipeFixture):
+    def test_central_reader_routes_foreground_and_resumes_same_seed_request(self):
+        e=self.start(b'x'*100); out=[]
+        t=threading.Thread(target=lambda:out.extend(e.generate([1,2,3],200,{'seed':424242},threading.Event())))
+        t.start();self.wait(lambda:len(out)>3)
+        hermes=list(e.generate([4,5],20,{},threading.Event(),_priority_role=Role.HERMES))
+        self.assertEqual(bytes(hermes[:-1]),b'HERMES')
+        self.assertTrue(t.is_alive());self.assertEqual(e.last['prompt_tokens'],2)
+        e.priority.lease_until=0;e.priority.tick();t.join(3)
+        self.assertFalse(t.is_alive());self.assertEqual(out,list(b'x'*100)+[257])
+        verbs=self.events.read_text().splitlines()
+        self.assertEqual(verbs.count('PGEN 1'),1)
+        self.assertEqual(verbs.count('PPAUSE 1'),1)
+        self.assertEqual(verbs.count('PRESUME 1'),1)
+        self.assertFalse(any(x.startswith('STOP') for x in verbs))
+    def test_parked_client_disconnect_cancels_only_itself(self):
+        e=self.start(b'x'*100);out=[];cancel=threading.Event()
+        t=threading.Thread(target=lambda:out.extend(e.generate([1,2,3],200,{},cancel)))
+        t.start();self.wait(lambda:len(out)>2)
+        h=e.priority.submit('GEN 20 4,5',Role.HERMES)
+        self.wait(lambda:e.priority.parked==1)
+        cancel.set();t.join(3)
+        self.assertFalse(t.is_alive());self.assertIsNone(e.priority.dead)
+        self.wait(lambda:h.state=='done');e.priority.release(h)
+        self.assertIn('PCANCEL 1',self.events.read_text())
+    def test_priority_disabled_legacy_protocol_unchanged(self):
+        e=self.start(priority=False)
+        self.assertEqual(list(e.generate([1,2,3],100,{},threading.Event())),list(b'background response')+[257])
+        self.assertIsNone(e.priority)
+        self.assertTrue(self.events.read_text().startswith('GEN 100'))
+    def test_engine_death_ends_parked_request(self):
+        e=self.start(b'x'*100);out=[];errors=[]
+        def run():
+            try:out.extend(e.generate([1,2,3],200,{},threading.Event()))
+            except Exception as error:errors.append(error)
+        t=threading.Thread(target=run);t.start();self.wait(lambda:len(out)>2)
+        list(e.generate([4,5],20,{},threading.Event(),_priority_role=Role.HERMES))
+        e.proc.kill();t.join(3)
+        self.assertFalse(t.is_alive());self.assertEqual(len(errors),1)
+    def test_mode_rejects_incompatible_configuration_before_launch(self):
+        for arg in ('--batch','--slots','--layer-split','--pipeline-windows','--lookup-chain'):
+            with self.assertRaises(ValueError):engine_args({'args':[arg,'2'],'priority':{'enabled':True}})
+        with self.assertRaises(ValueError):engine_args({'args':[],'parallel':2,'priority':{'enabled':True}})
+        with self.assertRaises(ValueError):engine_args({'args':[],'priority':{'idle_backfill':True}})
+        self.assertEqual(engine_args({'args':[]}),[])
+        self.assertIn('--priority-serving',engine_args({'args':[],'priority':{'enabled':True}}))
+    def test_priority_control_commands_cannot_interleave(self):
+        e=self.start()
+        with self.assertRaises(ValueError):e.session_file('save','/unused')
+        with self.assertRaises(ValueError):e.vram(None)
+    def test_foreground_reservation_consumed_once_without_second_renewal(self):
+        e=self.start();cancel=threading.Event()
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        with svc.trusted_priority_role(Role.HERMES):
+            with svc.foreground_reservation([1,2,3],100,{},cancel) as r:
+                lease=e.priority.lease_until
+                events=list(svc.run([1,2,3],False,[],100,{},cancel))
+                self.assertTrue(r.claimed)
+                self.assertEqual(e.priority.lease_until,lease)
+        self.assertEqual(self.events.read_text().count('PGEN 1\n'),1)
+        self.assertEqual(len([x for k,x in events if k=='done']),1)
+        self.assertEqual(e.priority.requests,{})
+    def test_preheader_refusal_is_typed_and_never_enters_header_scope(self):
+        e=StrataEngine('unused',[],lazy=True)
+        def send(line):
+            if line.startswith('PPAUSE'):e.priority.feed('PREFUSED 1 pause_unavailable')
+        e.priority=PriorityScheduler(send,timer=False)
+        b=e.priority.submit('GEN 100 1,2,3');headers=[]
+        with self.assertRaises(PriorityUnavailable):
+            r=e.reserve_priority([4,5],10,{},threading.Event())
+            headers.append('committed')
+            e.release_priority(r)
+        self.assertEqual(headers,[])
+        self.assertEqual(e.priority.active,b.id)
+        self.assertEqual(len(e.priority.requests),1)
+    def test_preheader_disconnect_releases_exact_reservation(self):
+        e=self.start(b'x'*100);cancel=threading.Event();cancel.set()
+        with self.assertRaises(PriorityUnavailable):e.reserve_priority([1,2,3],200,{},cancel)
+        self.assertEqual(e.priority.requests,{})
+        self.assertIn('PCANCEL 1',self.events.read_text())
+        self.assertNotIn('STOP',self.events.read_text())
+    def test_queued_cancel_wakes_reserve_priority_at_once(self):
+        e=self.start(b'x'*100)
+        out=[];cancel=threading.Event()
+        busy=threading.Thread(target=lambda:out.extend(e.generate([1,2,3],200,{},cancel)))
+        busy.start();self.wait(lambda:len(out)>2)          # the engine is busy: a foreground stays queued
+        wake=threading.Event();results=[]
+        def reserve():
+            wake.set()
+            try:e.reserve_priority([4,5],20,{},threading.Event(),timeout=120)
+            except Exception as error:results.append(error)
+        waiter=threading.Thread(target=reserve);waiter.start();wake.wait()
+        self.wait(lambda:any(r.role is Role.HERMES and r.state=='queued'
+                             for r in e.priority.requests.values()))
+        queued=next(r for r in e.priority.requests.values()
+                    if r.role is Role.HERMES and r.state=='queued')
+        began=time.monotonic();e.priority.cancel(queued)
+        waiter.join(5);took=time.monotonic()-began
+        self.assertFalse(waiter.is_alive())
+        self.assertLess(took,5)                            # no wait out to the admission deadline
+        self.assertEqual(len(results),1)
+        self.assertIsInstance(results[0],PriorityUnavailable)
+        self.assertIn('cancelled before admission',str(results[0]))
+        e.priority.release(queued)
+        cancel.set();busy.join(5);self.assertFalse(busy.is_alive())
+    def test_wait_events_surface_as_stream_notes(self):
+        e=self.start(b'x'*100);items=[]
+        def run():
+            for token in e.generate([1,2,3],200,{},threading.Event()):
+                items.append((token,getattr(e,'stream_note',None)))
+                if items and items[-1][0] is None:break    # the heartbeat that carries the note
+        t=threading.Thread(target=run);t.start()
+        self.wait(lambda:e.priority.active==1)
+        e.priority.requests[1].events.put('WAIT priority resume_refused attempt=3 reason=resume_unavailable')
+        t.join(5);self.assertFalse(t.is_alive())
+        self.assertIn((None,'priority resume_refused attempt=3 reason=resume_unavailable'),items)
+        self.assertIn('PCANCEL 1',self.wait_for(lambda:self.events.read_text()))
+    def wait_for(self,produce,timeout=3):
+        end=time.monotonic()+timeout;text=produce()
+        while not text and time.monotonic()<end:time.sleep(.001);text=produce()
+        return text
+    def test_sse_keepalive_carries_one_pending_note_then_plain_keepalive(self):
+        engine=type('Engine',(),{'stream_note':'priority resume_refused attempt=3 reason=resume_unavailable'})()
+        self.assertEqual(sse_keepalive(engine),b': priority resume_refused attempt=3 reason=resume_unavailable\n\n')
+        self.assertEqual(sse_keepalive(engine),b': keep-alive\n\n')    # a note is consumed once
+        self.assertEqual(sse_keepalive(type('Idle',(),{})()),b': keep-alive\n\n')
+    def test_priority_queue_limits_config_validation(self):
+        self.assertEqual(priority_queue_limits({}),(64,8*1024*1024))
+        self.assertEqual(priority_queue_limits({'priority':{}}),(64,8*1024*1024))
+        self.assertEqual(priority_queue_limits({'priority':{'max_queued_requests':3}}),(3,8*1024*1024))
+        self.assertEqual(priority_queue_limits({'priority':{'max_queued_command_bytes':4096}}),(64,4096))
+        for bad in ({'priority':{'max_queued_requests':0}},{'priority':{'max_queued_requests':True}},
+                    {'priority':{'max_queued_requests':1.5}},{'priority':{'max_queued_command_bytes':-1}},
+                    {'priority':{'max_queued_command_bytes':'8 MiB'}}):
+            with self.assertRaises(ValueError):priority_queue_limits(bad)
+        self.assertIn('--priority-serving',engine_args({'args':[],'priority':{'enabled':True,
+            'max_queued_requests':8,'max_queued_command_bytes':1024}}))
+        with self.assertRaises(ValueError):
+            engine_args({'args':[],'priority':{'enabled':True,'max_queued_requests':0}})
+    def test_queue_full_refusal_is_typed_before_the_stream_starts(self):
+        e=self.start(b'x'*100)
+        out=[];cancel=threading.Event()
+        busy=threading.Thread(target=lambda:out.extend(e.generate([1,2,3],200,{},cancel)))
+        busy.start();self.wait(lambda:len(out)>2)
+        e.priority.max_queued_requests=0                   # nothing may queue behind the running request
+        with self.assertRaises(PriorityQueueFull):
+            e.reserve_priority([4,5],20,{},threading.Event(),timeout=1)
+        # the refused submission left nothing behind: only the running background request remains
+        self.assertEqual([r.role for r in e.priority.requests.values()],[Role.BACKGROUND])
+        cancel.set();busy.join(5);self.assertFalse(busy.is_alive())
+    def test_native_failure_after_headers_ends_same_stream(self):
+        e=self.start(b'x'*100);cancel=threading.Event()
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        with svc.trusted_priority_role(Role.HERMES):
+            with svc.foreground_reservation([1,2,3],200,{},cancel):
+                headers_committed=True
+                stream=svc.run([1,2,3],False,[],200,{},cancel)
+                next(stream);e.proc.kill()
+                with self.assertRaises(EngineDied):list(stream)
+                self.assertTrue(headers_committed)
+        self.assertEqual(e.priority.requests,{})
+    def test_old_generator_cleanup_after_restart_preserves_new_request(self):
+        e=self.start(b'x'*100)
+        old_stream=e.generate([1,2,3],200,{},threading.Event());next(old_stream)
+        old=e.priority;old.fail(PriorityProtocolError('fixture generation ended'))
+        e.restart(tries=1)
+        current=e.priority.submit('GEN 200 4,5,6')
+        self.assertEqual(current.id,1)
+        old_stream.close()
+        self.assertIs(e.priority.requests[1],current)
+        e.priority.tick();self.assertIsNone(e.priority.dead)
+        self.wait(lambda:current.state=='done');e.release_priority(current)
+    def test_old_reservation_scope_after_restart_preserves_new_request(self):
+        e=self.start(b'x'*100);svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        with svc.trusted_priority_role(Role.HERMES):
+            with svc.foreground_reservation([1,2,3],200,{},threading.Event()) as old_request:
+                old=e.priority;old.fail(PriorityProtocolError('fixture generation ended'))
+                e.restart(tries=1);current=e.priority.submit('GEN 200 4,5,6')
+                self.assertEqual(current.id,old_request.id)
+            self.assertIs(e.priority.requests[1],current)
+            e.release_priority(old_request)
+        self.assertIs(e.priority.requests[1],current)
+        e.priority.tick();self.assertIsNone(e.priority.dead)
+        self.wait(lambda:current.state=='done');e.release_priority(current)
+    def test_first_lazy_background_request_can_be_preempted(self):
+        e=self.start(b'x'*200,lazy=True)
+        self.assertIsNone(e.priority);self.assertTrue(e.priority_configured)
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        out=[];errors=[];cancel=threading.Event()
+        def background():
+            try:out.extend(svc.run([1,2,3],False,[],512,{},cancel))
+            except Exception as error:errors.append(error)
+        t=threading.Thread(target=background,daemon=True);t.start()
+        try:
+            self.wait(lambda:e.priority is not None and e.priority.active==1 and len(out)>2)
+            self.assertFalse(svc.fifo.locked())
+            with svc.trusted_priority_role(Role.HERMES):
+                with svc.foreground_reservation([4,5],20,{},threading.Event(),timeout=2):
+                    foreground=list(svc.run([4,5],False,[],20,{},threading.Event()))
+            self.assertTrue(t.is_alive());self.assertEqual(e.priority.parked,1)
+            self.assertEqual(len([x for k,x in foreground if k=='done']),1)
+            e.priority.lease_until=0;e.priority.tick();t.join(3)
+            self.assertFalse(t.is_alive());self.assertEqual(errors,[])
+            self.assertIn('PPAUSE 1',self.events.read_text())
+        finally:
+            cancel.set();e.close();t.join(3)
+    def test_service_reasoning_continuation_holds_http_owner_after_expiry(self):
+        e=self.start(b'x'*100);svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        svc.reasoning_close_retry=True
+        clock=Clock();clock.now=time.monotonic()+1;e.priority.clock=clock
+        original_feed=e.priority.feed
+        def feed(line):
+            if line and line.startswith('R 2 DONE '):clock.now=e.priority.lease_until+1
+            original_feed(line)
+        e.priority.feed=feed
+        background=[];errors=[];cancel=threading.Event()
+        def bg():
+            try:background.extend(e.generate([1,2,3],200,{},cancel))
+            except Exception as error:errors.append(error)
+        t=threading.Thread(target=bg,daemon=True);t.start();self.wait(lambda:len(background)>2)
+        try:
+            with svc.trusted_priority_role(Role.HERMES):
+                with svc.foreground_reservation([4,5],256,{},threading.Event()):
+                    foreground=list(svc.run([4,5],True,[],256,{},threading.Event()))
+                self.assertTrue(t.is_alive());self.assertEqual(e.priority.parked,1)
+                self.assertGreater(clock.now,e.priority.lease_until)
+                self.assertNotIn('PRESUME 1',self.events.read_text())
+                self.assertIn('PGEN 3',self.events.read_text())
+            t.join(3);self.assertFalse(t.is_alive());self.assertEqual(errors,[])
+            self.assertEqual(len([x for k,x in foreground if k=='done']),1)
+            commands=self.events.read_text()
+            self.assertLess(commands.index('PGEN 3'),commands.index('PRESUME 1'))
+        finally:
+            cancel.set();e.close();t.join(3)
+
+
+class StreamingQueueFullTests(PipeFixture):
+    """The byte-bound queue refusal on the streaming endpoints: real HTTP, machine-readable
+    code in each endpoint's error-event format after headers are committed."""
+
+    def start_http(self, bytes_limit):
+        e=self.start(priority=True,lazy=True)
+        e.priority_queue_limits=(64,bytes_limit)   # read when the lazy scheduler is created
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd=serve(svc,port=0)
+        self.addCleanup(httpd.shutdown);self.addCleanup(httpd.server_close)
+        self.addCleanup(e.close)
+        return svc,f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def post_stream(self,base,path,body):
+        request=urllib.request.Request(base+path,data=json.dumps(body).encode(),
+            headers={'Content-Type':'application/json'})
+        try:
+            with urllib.request.urlopen(request,timeout=10) as r:
+                return r.status,r.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code,error.read().decode()
+
+    def test_anthropic_stream_surfaces_priority_queue_full_after_headers(self):
+        svc,base=self.start_http(bytes_limit=8)   # any real command exceeds the byte bound
+        status,body=self.post_stream(base,'/v1/messages',
+            {'model':'m','max_tokens':8,'stream':True,'messages':[{'role':'user','content':'hello'}]})
+        self.assertEqual(status,200)              # headers were already committed
+        self.assertIn('event: error',body)
+        self.assertIn('priority_queue_full',body)
+        self.assertNotIn('keep-alive',body.split('event: error')[0][-40:])
+
+    def test_responses_stream_surfaces_priority_queue_full_after_headers(self):
+        svc,base=self.start_http(bytes_limit=8)
+        status,body=self.post_stream(base,'/v1/responses',
+            {'model':'m','stream':True,'input':'hello'})
+        self.assertEqual(status,200)
+        self.assertIn('response.failed',body)
+        self.assertIn('priority_queue_full',body)
+
+    def start_http_spill(self, spill_lost=True):
+        e = self.start(b'x'*40, lazy=True, spill=True, spill_lost=spill_lost, spill_config=SPILL_ENABLED)
+        svc = Service(e, ByteTokenizer(), ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.shutdown); self.addCleanup(httpd.server_close); self.addCleanup(e.close)
+        return e, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def test_lost_capsule_surfaces_as_a_typed_stream_error_on_all_three_transports(self):
+        cases = (('/v1/chat/completions', {'model': 'm', 'max_tokens': 200, 'stream': True,
+                                          'messages': [{'role': 'user', 'content': 'hello'}]},
+                  '"code": "priority_spill_lost"'),
+                 ('/v1/responses', {'model': 'm', 'stream': True, 'input': 'hello'}, 'response.failed'),
+                 ('/v1/messages', {'model': 'm', 'max_tokens': 200, 'stream': True,
+                                   'messages': [{'role': 'user', 'content': 'hello'}]}, 'event: error'))
+        for path, body, marker in cases:
+            Path(str(self.events)).unlink(missing_ok=True)   # a fresh event log for each transport
+            e, base = self.start_http_spill()
+            requests, errors = [], []
+            def run():
+                try:
+                    requests.append(self.post_stream(base, path, body))
+                except Exception as error:
+                    errors.append(error)
+            t = threading.Thread(target=run); t.start()
+            self.wait(lambda: e.priority is not None and Path(str(self.events)).exists()
+                      and 'PGEN 1' in Path(str(self.events)).read_text(), timeout=15)
+            h = e.priority.submit('GEN 20 9,8', Role.HERMES)
+            self.wait(lambda: e.priority.parked == 1 and h.state == 'done', timeout=15)
+            e.priority.release(h)
+            e.priority.lease_until = 0; e.priority.tick()
+            t.join(20); self.assertFalse(t.is_alive(), path)
+            self.assertEqual(errors, [], path)
+            status, text = requests[0]
+            self.assertEqual(status, 200, path)               # headers streamed: a typed in-stream error
+            self.assertIn(marker, text, path)
+            self.assertIn('priority_spill_lost', text, path)
+            self.assertNotIn('RESUMED', Path(str(self.events)).read_text(), path)
+
+    def test_configured_zero_silence_means_no_limit(self):
+        import math
+        e=self.start(priority=True,lazy=True)
+        e.silence_s=0
+        e.restart()                                   # the scheduler is built with 0 carried
+        self.assertEqual(e.priority.silence, math.inf)
+        r=e.priority.submit('GEN 100 1,2,3');self.wait(lambda:r.state=='running')
+        e.priority.clock=lambda: time.monotonic()+10**9   # far past any finite allowance
+        e.priority.tick()                             # an infinite allowance never trips
+        self.assertIsNone(e.priority.dead)
+        self.assertEqual(r.state,'running')
+
+    def test_anthropic_stream_surfaces_persistent_resume_refusal_typed(self):
+        e=self.start(priority=True,lazy=True)
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd=serve(svc,port=0);self.addCleanup(httpd.shutdown);self.addCleanup(httpd.server_close);self.addCleanup(e.close)
+        body=json.dumps({'model':'m','max_tokens':400,'stream':True,
+                         'messages':[{'role':'user','content':'hello'}]}).encode()
+        result={}
+        def bg():
+            try:
+                r=urllib.request.urlopen(urllib.request.Request(
+                    f'http://127.0.0.1:{httpd.server_address[1]}/v1/messages',data=body,
+                    headers={'Content-Type':'application/json'}),timeout=30)
+                result['body']=r.read().decode()
+            except Exception as error:result['error']=repr(error)
+        thread=threading.Thread(target=bg);thread.start()
+        self.wait(lambda:Path(str(self.events)).exists() and 'PGEN 1' in Path(str(self.events)).read_text())
+        h=e.priority.submit('GEN 10 9,8',Role.HERMES)          # parks the background stream
+        self.wait(lambda:e.priority.parked==1 and h.state=='done')
+        # Backdate the refusal episode, suppress the next PRESUME on the wire, and let the
+        # in-flight resume attempt be refused: stranding requires a real refusal context.
+        e.priority.resume_first_refusal=e.priority.clock()-(e.priority.resume_retry_deadline+1)
+        e.priority.resume_refusals=3
+        real_write=e.priority._write
+        e.priority._write=lambda line: None if line.startswith('PRESUME') else real_write(line)
+        e.priority.lease_until=0;e.priority.tick()
+        e.priority.feed('PREFUSED 1 resume_unavailable')
+        thread.join(20);self.assertFalse(thread.is_alive())
+        self.assertIn('priority_resume_refused_persistent',result.get('body',''))
+        self.assertIn('event: error',result.get('body',''))
+
+    def test_preheader_check_bypasses_an_admitted_vip_reservation(self):
+        from serve.server import priority_preheader_queue_full
+        svc,base=self.start_http(bytes_limit=8*1024*1024)
+        e=svc.engine
+        e.restart()                               # lazy: __init__ runs now, with the limits above
+        e.priority.max_queued_requests=1
+        a=e.priority.submit('GEN 100 1,2,3')      # admitted: running, not queued
+        b=e.priority.submit('GEN 100 4,5,6')      # a owns the engine: b is the one queued slot
+        self.assertEqual(b.state,'queued')
+        self.assertTrue(e.priority.queue_full())
+        self.assertTrue(priority_preheader_queue_full(svc))
+        with svc.trusted_priority_role(Role.HERMES):
+            svc._priority_role.reservation=object()   # an admitted foreground reservation
+            self.assertFalse(priority_preheader_queue_full(svc))
+            svc._priority_role.reservation=None
+
+
+if __name__=='__main__':unittest.main()
+
+
+SPILL_ENABLED = {'enabled': True, 'dir': '/nonexistent/spill', 'mode': 'fallback', 'min_free_mib': 4096}
+
+
+class SpillConfigTests(unittest.TestCase):
+    """The spill settings are validated before anything is spawned, and the native flags come from exactly one place."""
+    def test_absent_or_off_settings_enable_nothing(self):
+        self.assertFalse(priority_spill_settings({})['enabled'])
+        self.assertFalse(priority_spill_settings({'priority': {}})['enabled'])
+        self.assertFalse(priority_spill_settings({'priority': {'spill_dir': '/var/spill',
+                                                               'spill_mode': 'off'}})['enabled'])
+    def test_a_directory_defaults_to_fallback(self):
+        settings = priority_spill_settings({'priority': {'spill_dir': '/var/spill'}})
+        self.assertTrue(settings['enabled'])
+        self.assertEqual((settings['mode'], settings['min_free_mib']), ('fallback', 4096))
+    def test_rejected_values(self):
+        for priority in ({'spill_mode': 'sometimes'}, {'spill_mode': True}, {'spill_mode': 'always'},
+                         {'spill_dir': 'relative/path'}, {'spill_dir': ''}, {'spill_dir': 5},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': -1},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': True},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': 1.5},
+                         {'spill_dir': '/var/spill', 'spill_min_free_mib': 2**63 // 1048576 + 1},
+                         {'spill_min_free_mib': 4096}, {'priority': 'x'}):
+            with self.assertRaises(ValueError, msg=repr(priority)):
+                priority_spill_settings({'priority': priority} if 'priority' not in priority else priority)
+    def test_the_native_flags_are_not_duplicated_through_args(self):
+        with self.assertRaises(ValueError):
+            priority_spill_settings({'priority': {'spill_dir': '/var/spill'},
+                                     'args': ['--priority-spill-dir', '/var/spill']})
+    def test_engine_args_emit_the_flags_once_priority_serves(self):
+        cfg = {'args': ['--pack', 'pack'], 'priority': {'enabled': True, 'spill_dir': '/var/spill',
+                                                        'spill_mode': 'always', 'spill_min_free_mib': 0}}
+        args = engine_args(cfg)
+        self.assertIn('--priority-serving', args)
+        self.assertEqual(args[args.index('--priority-spill-dir') + 1], '/var/spill')
+        self.assertEqual(args[args.index('--priority-spill-mode') + 1], 'always')
+        self.assertEqual(args[args.index('--priority-spill-min-free-mib') + 1], '0')
+    def test_active_spill_requires_priority_serving(self):
+        # A directory with a serving mode, but no priority serving: the flags would mean nothing.
+        with self.assertRaises(ValueError):
+            engine_args({'args': ['--pack', 'pack'], 'priority': {'enabled': False, 'spill_dir': '/var/spill'}})
+    def test_the_directory_is_validated_without_changing_an_existing_one(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as root:
+            good = os.path.join(root, 'spill')
+            os.mkdir(good, 0o700)
+            before = os.lstat(good)
+            prepare_spill_directory(good)                  # accepted, untouched
+            after = os.lstat(good)
+            self.assertEqual((before.st_mode, before.st_uid), (after.st_mode, after.st_uid))
+            # Only the final missing component may be created, and with mode 0700.
+            missing = os.path.join(root, 'created')
+            prepare_spill_directory(missing)
+            self.assertEqual(stat.S_IMODE(os.lstat(missing).st_mode), 0o700)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(os.path.join(root, 'absent-parent', 'spill'))
+            loose = os.path.join(root, 'loose')
+            os.mkdir(loose, 0o755)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(loose)
+            link = os.path.join(root, 'link')
+            os.symlink(good, link)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(link)
+            with self.assertRaises(ValueError):
+                prepare_spill_directory('relative/spill')
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(root + '/../spill')
+            plain = os.path.join(root, 'plain')
+            open(plain, 'w').close()
+            with self.assertRaises(ValueError):
+                prepare_spill_directory(plain)
+
+
+class SpillProtocolTests(PipeFixture):
+    """End to end through the real pipe reader: capability, the parked location, and the typed loss."""
+    def test_capable_engine_marks_the_park_on_disk(self):
+        e = self.start(b'x'*40, spill=True, spill_config=SPILL_ENABLED); out = []
+        t = threading.Thread(target=lambda: out.extend(e.generate([1,2,3], 200, {'seed': 424242}, threading.Event())))
+        t.start(); self.wait(lambda: len(out) > 2, timeout=15)
+        h = e.priority.submit('GEN 20 4,5', Role.HERMES)
+        self.wait(lambda: e.priority.parked == 1, timeout=15)
+        self.assertTrue(e.priority.snapshot()['parked_on_disk'])
+        self.assertTrue(any(entry[1] == 'parked_on_disk' for entry in e.priority.protocol_evidence))
+        svc = Service(e, ByteTokenizer(), ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        self.assertTrue(svc.metrics()['priority']['parked_on_disk'])
+        self.wait(lambda: h.state == 'done', timeout=15); e.priority.release(h)
+        e.priority.lease_until = 0; e.priority.tick(); t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertFalse(e.priority.snapshot()['parked_on_disk'])
+
+    def test_a_spill_enabled_server_refuses_an_engine_without_the_capability(self):
+        with self.assertRaises(ValueError):
+            self.start(b'x', spill_config=SPILL_ENABLED)     # the fake does not advertise priority_spill
+        self.assertIsNone(self.engine)                       # the refused start left no engine behind
+
+    def test_a_lost_capsule_ends_the_parked_stream_with_one_typed_error(self):
+        e = self.start(b'x'*40, spill=True, spill_lost=True, spill_config=SPILL_ENABLED)
+        out, errors = [], []
+        def run():
+            try: out.extend(e.generate([1,2,3], 200, {}, threading.Event()))
+            except Exception as error: errors.append(error)
+        t = threading.Thread(target=run); t.start()
+        self.wait(lambda: len(out) > 2, timeout=15)
+        h = e.priority.submit('GEN 20 4,5', Role.HERMES)
+        self.wait(lambda: e.priority.parked == 1 and e.priority.snapshot()['parked_on_disk'], timeout=15)
+        self.wait(lambda: h.state == 'done', timeout=15); e.priority.release(h)
+        before = list(out)
+        e.priority.lease_until = 0; e.priority.tick(); t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], PrioritySpillLost)
+        self.assertEqual(errors[0].code, 'priority_spill_lost')
+        self.assertEqual(out, before)                       # no token after the loss, no replay
+        self.assertFalse(any(line.startswith('RESUMED') for line in self.events.read_text().splitlines()))
+        self.assertFalse(any(line.startswith('PCANCEL') for line in self.events.read_text().splitlines()))
+        self.assertIsNone(e.priority.parked)
+        self.assertFalse(e.priority.snapshot()['parked_on_disk'])
+        # The engine is healthy: the next request runs normally.
+        self.assertEqual(list(e.generate([7], 200, {}, threading.Event()))[-1], 257)

@@ -299,6 +299,7 @@ public:
     /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
     int service(PoolMultiFn pool, void* user, std::string& err);
     bool in_flight() const { return fl_active_; }
+    bool commit_pending() const { return commit_pending_ || commit_live_; }
     /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
     bool done(std::string& err);
     /// After `done`: the profile, the last stage's host sampling and picks (`out` may be null on an earlier stage).

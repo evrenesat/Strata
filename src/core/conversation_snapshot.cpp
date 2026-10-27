@@ -11,66 +11,10 @@
 
 namespace strata::core {
 namespace {
-struct Layout {
-    int format;
-    int64_t cells, pooled_rows, page_size;
-    size_t data, scales, pooled, value_data, value_scales;
-};
 
-bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
-    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
-    if (upto < 0 || upto > st.max_cells || upto > std::numeric_limits<int64_t>::max() - (page - 1)) {
-        error = "conversation snapshot: invalid K/V extent";
-        return false;
-    }
-    return true;
-}
-
-bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error) {
-    if (!valid_extent(st, upto, error)) return false;
-    if (st.kv_hybrid && (st.kv_mode == 2 || st.kv_q4 || st.kv_int8)) {   // a streamed one reads its host copy
-        error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
-        return false;
-    }
-    const auto s = strata::kernels::qsa_real_shapes();
-    const bool int8_keys = st.kv_int8 || st.kv_hybrid;
-    if (g.n_head_kv <= 0 || g.head_dim <= 0 || g.head_dim > INT32_MAX || g.idx_key_dim <= 0 ||
-        (st.kv_q4 && g.head_dim % 32) || (int8_keys && !st.kv_q4 && g.head_dim % 64)) {
-        error = "conversation snapshot: invalid K/V geometry";
-        return false;
-    }
-    const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
-    const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
-                              : (size_t) g.head_dim * (int8_keys ? 1 : 2);
-    // Include the moving spare row, not only completed blocks. The checkpoint
-    // restore reconstructs that row when rewinding to an earlier prefix.
-    const int64_t pooled = index && upto > 0 ? upto / s.idx_block + 1 : 0;
-    // Format 3 identifies snapshot K8V4 only; never pass it to the block movers.  Rotated INT8 K/V (#293,
-    // STRATA_KV_ROT=1) is another format too (+16): its bytes mean nothing to a state that does not rotate, so a
-    // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
-    // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
-    const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
-    using conversation_detail::product;
-    if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
-        !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
-                           int8_keys && !st.kv_q4 ? (uint64_t) (g.head_dim / 64) * 2 : 0}) ||
-        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float)})) {
-        error = "conversation snapshot: K/V byte count overflow";
-        return false;
-    }
-    l.value_data = l.data;
-    l.value_scales = l.scales;
-    if (st.kv_hybrid) {
-        if (!product(l.value_data, {(uint64_t) cells, (uint64_t) g.n_head_kv,
-                                   (uint64_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)})) {
-            error = "conversation snapshot: hybrid V byte count overflow";
-            return false;
-        }
-        l.value_scales = 0;
-    }
-    return true;
-}
+// The layout and target verdicts live in conversation_kv_layout.cpp so the RAM path, the disk capsule and the tests
+// share one definition; these are the names the call sites in this file read.
+using Layout = ConversationKvLayout;
 
 std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     const bool host = st.kv_mode != 0 && !resident;
@@ -83,31 +27,6 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
         return {host ? st.host.k_q : st.k_q, host ? st.host.v_q : st.v_q,
                 host ? st.host.k_scale : st.k_scale, host ? st.host.v_scale : st.v_scale, st.idx_pooled};
     return {host ? st.host.k_pool : st.k_pool, host ? st.host.v_pool : st.v_pool, nullptr, nullptr, st.idx_pooled};
-}
-
-bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error) {
-    if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
-        st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
-        (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
-        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
-        error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
-        return false;
-    }
-    if (st.kv_mode == 1) {
-        const auto& m = st.map;
-        if (m.n_blocks != st.n_pages || m.n_slots != st.n_slots || !m.page_table || !m.slot_block ||
-            !m.slot_stamp || !m.slot_ref || !m.ctl || !m.miss_block || !m.miss_slot) {
-            error = "conversation snapshot: invalid streaming map";
-            return false;
-        }
-    }
-    if (st.kv_mode == 2 && (!st.page_table ||
-        (st.kv_q4 ? !st.k_q4 || !st.v_q4 : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
-                                                    : !st.k_pool || !st.v_pool))) {
-        error = "conversation snapshot: invalid draft ring";
-        return false;
-    }
-    return true;
 }
 
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
@@ -124,7 +43,8 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                    int64_t upto, bool index, size_t& bytes, std::string& error) {
     Layout l{};
-    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    if (!conversation_kv_layout(st, g, upto, index, l, error) ||
+        !conversation_kv_layout_targets(l, st, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> buffers = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     bytes = 0;
@@ -148,8 +68,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                           int64_t upto, bool index, std::string& error,
                           int64_t unchanged_tokens, size_t* reused_bytes) {
     Layout l{};
-    if (!layout(st, g, upto, index, l, error)) return false;
-    if (!valid(st, l, upto, error)) return false;
+    if (!conversation_kv_layout(st, g, upto, index, l, error)) return false;
+    if (!conversation_kv_layout_targets(l, st, upto, error)) return false;
     if (unchanged_tokens < 0 || unchanged_tokens > upto || unchanged_tokens > image.cells) {
         error = "conversation snapshot: invalid unchanged prefix";
         return false;
@@ -183,8 +103,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                               int64_t upto, bool index, std::string& error) {
     Layout l{};
-    if (!layout(st, g, upto, index, l, error)) return false;
-    if (!valid(st, l, upto, error)) return false;
+    if (!conversation_kv_layout(st, g, upto, index, l, error)) return false;
+    if (!conversation_kv_layout_targets(l, st, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
@@ -219,6 +139,11 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
     return false;
 }
 } // namespace
+
+bool conversation_kv_finish_restore(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    // Public spill-restore entry point (priority/capsule restore paths): the same residency refill.
+    return refresh_residency(st, g, upto, error);
+}
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error, bool queued) {
@@ -284,10 +209,195 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     return refresh_residency(st, g, upto, error);
 }
 
+bool conversation_kv_visit(const ConversationKv& image, const KvBlockSink& sink, std::string& error) {
+    if (!sink) { error = "conversation snapshot: no K/V sink"; return false; }
+    const std::array<const ConversationBuffer*,5> buffers = {&image.k,&image.v,&image.k_scale,&image.v_scale,
+                                                             &image.pooled};
+    for (size_t part = 0; part < buffers.size(); ++part) {
+        if (buffers[part]->empty()) continue;
+        if (!buffers[part]->visit(0, buffers[part]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return sink(part, at, p, n, error);
+            })) return false;
+    }
+    return true;
+}
+
+KvBlockSink conversation_kv_writer(const QsaState& st, const ConversationKvLayout& layout, std::string& error) {
+    const auto sizes = layout.part_sizes();
+    const auto destinations = pools(st);
+    for (size_t part = 0; part < sizes.size(); ++part)
+        if (sizes[part] && !destinations[part]) {
+            error = "conversation snapshot: missing target state buffer";
+            return {};
+        }
+    return [sizes, destinations](size_t part, uint64_t offset, const uint8_t* data, size_t n,
+                                 std::string& why) -> bool {
+        if (part >= sizes.size() || offset > sizes[part] || n > sizes[part] - offset) {
+            why = "conversation snapshot: K/V block out of range";
+            return false;
+        }
+        return transfer(static_cast<uint8_t*>(destinations[part]) + offset, data, n, why);
+    };
+}
+
+ConversationKvRestoreResult conversation_kv_restore_source(const QsaState& st, const ModelGeometry& g, int64_t upto,
+                                                           bool include_index, const KvDriveFn& drive) {
+    ConversationKvRestoreResult result;
+    Layout l{};
+    if (!conversation_kv_layout(st, g, upto, include_index, l, result.error) ||
+        !conversation_kv_layout_targets(l, st, upto, result.error)) return result;   // invalid: nothing written
+    KvBlockSink writer = conversation_kv_writer(st, l, result.error);
+    if (!writer) return result;
+    KvTransfer transfer;
+    transfer.drive = drive;
+    transfer.write = writer;
+    const KvTransferResult ran = kv_transfer_run(transfer);
+    result.detail = ran.outcome;
+    result.verified_bytes = ran.verified_bytes;
+    result.error = ran.error;
+    if (!ran.ok) {
+        result.outcome = ran.outcome == KvTransferOutcome::fatal ? ConversationRestore::transfer_failed
+                                                                 : ConversationRestore::invalid;
+        return result;
+    }
+    if (!conversation_kv_finish_restore(st, g, upto, result.error)) {
+        result.outcome = ConversationRestore::transfer_failed;   // the pools are written; residency did not follow
+        return result;
+    }
+    result.outcome = ConversationRestore::restored;
+    return result;
+}
+
+ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive,
+                                                           const std::function<bool(std::string&)>& before_draft) {
+    ConversationKvRestoreResult result;
+    if (targets.empty()) { result.error = "conversation snapshot: no K/V layers to restore"; return result; }
+    if (!drive) { result.error = "conversation snapshot: no K/V source"; return result; }
+    // Every layout validated and every destination prepared BEFORE the first write, across all layers: that is what
+    // keeps the capsule's single mutation boundary meaningful.
+    size_t main_layers = 0;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].draft && i + 1 != targets.size()) {
+            result.error = "conversation snapshot: the draft entry must be the last target";
+            return result;
+        }
+        if (!targets[i].draft) ++main_layers;
+    }
+    std::vector<Layout> layouts(targets.size());
+    std::vector<KvBlockSink> writers(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const auto& target = targets[i];
+        if (!target.state) { result.error = "conversation snapshot: missing K/V target state"; return result; }
+        if (!conversation_kv_layout(*target.state, g, target.upto, !target.draft, layouts[i], result.error) ||
+            !conversation_kv_layout_targets(layouts[i], *target.state, target.upto, result.error)) return result;
+        writers[i] = conversation_kv_writer(*target.state, layouts[i], result.error);
+        if (!writers[i]) return result;
+    }
+    const bool has_draft = targets.back().draft;
+    bool draft_hook_ran = false;
+    const KvLayerSink sink = [&](size_t layer, bool draft, size_t part, uint64_t offset, const uint8_t* data,
+                                 size_t n, std::string& why) -> bool {
+        if (draft) {
+            if (!has_draft) { why = "conversation snapshot: K/V block for a draft layer this session does not own"; return false; }
+            // Every main block is in place now, so the main layers' recurrent state can be restored before the draft's
+            // own K/V starts: one hook, exactly once, at that boundary.
+            if (!draft_hook_ran) {
+                draft_hook_ran = true;
+                if (before_draft && !before_draft(why)) return false;
+            }
+            return writers.back()(part, offset, data, n, why);
+        }
+        if (layer >= main_layers) { why = "conversation snapshot: K/V block for a layer this session does not own"; return false; }
+        return writers[layer](part, offset, data, n, why);
+    };
+    const KvTransferResult ran = kv_layer_transfer_run(drive, sink);
+    result.detail = ran.outcome;
+    result.verified_bytes = ran.verified_bytes;
+    result.error = ran.error;
+    if (!ran.ok) {
+        result.outcome = ran.outcome == KvTransferOutcome::fatal ? ConversationRestore::transfer_failed
+                                                                 : ConversationRestore::invalid;
+        return result;
+    }
+    for (const auto& target : targets)
+        if (!conversation_kv_finish_restore(*target.state, g, target.upto, result.error)) {
+            result.outcome = ConversationRestore::transfer_failed;   // written, but residency did not follow
+            return result;
+        }
+    result.outcome = ConversationRestore::restored;
+    return result;
+}
+
+ConversationKvRestoreResult conversation_kv_compare_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive, uint64_t& fingerprint) {
+    ConversationKvRestoreResult result;
+    fingerprint = 1469598103934665603ull;
+    if (targets.empty()) { result.error = "conversation snapshot: no K/V layers to compare"; return result; }
+    if (!drive) { result.error = "conversation snapshot: no K/V source"; return result; }
+    size_t main_layers = 0;
+    std::vector<Layout> layouts(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].draft && i + 1 != targets.size()) {
+            result.error = "conversation snapshot: the draft entry must be the last target";
+            return result;
+        }
+        if (!targets[i].draft) ++main_layers;
+        if (!targets[i].state) { result.error = "conversation snapshot: missing K/V target state"; return result; }
+        if (!conversation_kv_layout(*targets[i].state, g, targets[i].upto, !targets[i].draft, layouts[i],
+                                    result.error)) return result;
+    }
+    const bool has_draft = targets.back().draft;
+    uint64_t hash = fingerprint;
+    std::array<uint8_t, 65536> scratch;
+    // A compare-only walk: nothing is written, so this needs no mutation boundary - it either matches or it does not.
+    const auto compare_block = [&](size_t index, size_t part, uint64_t offset, const uint8_t* data, size_t n,
+                                   std::string& why) -> bool {
+        const auto sizes = layouts[index].part_sizes();
+        if (part >= sizes.size() || offset > sizes[part] || n > sizes[part] - offset) {
+            why = "conversation snapshot: K/V block out of range";
+            return false;
+        }
+        const auto pools = ::strata::core::pools(*targets[index].state);   // the live destination
+        const auto* device = static_cast<const uint8_t*>(pools[part]) + offset;
+        for (size_t at = 0; at < n;) {
+            const size_t take = std::min(scratch.size(), n - at);
+            if (!transfer(scratch.data(), device + at, take, why)) return false;
+            if (std::memcmp(scratch.data(), data + at, take) != 0) {
+                why = "conversation snapshot: restored K/V bytes differ";
+                return false;
+            }
+            for (size_t i = 0; i < take; ++i) { hash ^= scratch[i]; hash *= 1099511628211ull; }
+            at += take;
+        }
+        return true;
+    };
+    const KvLayerSink sink = [&](size_t layer, bool draft, size_t part, uint64_t offset, const uint8_t* data,
+                                 size_t n, std::string& why) -> bool {
+        if (draft) {
+            if (!has_draft) { why = "conversation snapshot: K/V block for a draft layer this session does not own"; return false; }
+            return compare_block(targets.size() - 1, part, offset, data, n, why);
+        }
+        if (layer >= main_layers) { why = "conversation snapshot: K/V block for a layer this session does not own"; return false; }
+        return compare_block(layer, part, offset, data, n, why);
+    };
+    const KvTransferResult ran = kv_layer_transfer_run(drive, sink);
+    result.detail = ran.outcome;
+    result.verified_bytes = ran.verified_bytes;
+    result.error = ran.error;
+    fingerprint = hash;
+    result.outcome = ran.ok ? ConversationRestore::restored
+                            : (ran.outcome == KvTransferOutcome::fatal ? ConversationRestore::transfer_failed
+                                                                      : ConversationRestore::invalid);
+    return result;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
-    if (!layout(st, g, upto, index, l, error)) return false;
+    if (!conversation_kv_layout(st, g, upto, index, l, error)) return false;
     sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     return true;
 }
@@ -295,7 +405,8 @@ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int6
 bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const ModelGeometry& g,
                             int64_t upto, bool index, std::string& error) {
     Layout l{};
-    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    if (!conversation_kv_layout(st, g, upto, index, l, error) ||
+        !conversation_kv_layout_targets(l, st, upto, error)) return false;
     SessionKvSource s;
     s.format = l.format; s.cells = l.cells; s.heads = g.n_head_kv; s.head_dim = g.head_dim;
     s.page_size = l.page_size; s.pooled_rows = l.pooled_rows; s.idx_dim = g.idx_key_dim;
@@ -313,7 +424,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
+                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error,bool restored_residency) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
@@ -336,7 +447,7 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
             })) return false;
-    if (st.kv_mode == 2 && image.cells > 0) {
+    if (restored_residency && st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
         const int64_t end = image.cells / image.page_size;
         const int64_t begin = std::max<int64_t>(0, end - st.n_slots);
