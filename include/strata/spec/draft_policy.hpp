@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include "strata/core/proof_hash.hpp"
 
 namespace strata::spec {
 
@@ -45,6 +46,10 @@ public:
     double chain_rate(int match) const;
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
+    void proof_hash(core::ProofHash& h) const {
+        h.add(max_t_); h.add(margin_); h.add(cost_); h.add(cost_n_); h.add(mtp_tok_); h.add(mtp_n_);
+        h.add(ok_); h.add(bad_); h.add(cok_); h.add(cbad_); h.add(rounds_); h.add(last_);
+    }
 
 private:
     static int bucket(int match);

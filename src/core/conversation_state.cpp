@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <cstring>
+#include "strata/core/proof_hash.hpp"
 
 namespace strata::core {
 namespace {
@@ -190,6 +192,74 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
     return sync(error);
+}
+
+namespace {
+bool proof_running(const ConversationCheckpoint* expected,const SessionState& ss,const ModelGeometry& g,
+                   core::ProofHash& hash,std::string& error) {
+    ConversationStateSizes z;
+    if(!conversation_session_sizes(g,ss,z,error)) return false;
+    std::array<uint8_t,65536> buffer;
+    auto read=[&](const void* source,const uint8_t* saved,size_t n) {
+        hash.add(n);
+        for(size_t at=0;at<n;) {
+            const size_t bytes=std::min(buffer.size(),n-at);
+            if(!copy(buffer.data(),static_cast<const uint8_t*>(source)+at,bytes,error)) return false;
+            if(saved && std::memcmp(buffer.data(),saved+at,bytes))
+                return fail(error,"restored running-state bytes differ");
+            hash.raw(buffer.data(),bytes);at+=bytes;
+        }
+        return true;
+    };
+    if(!read(ss.gdn_state,expected ? expected->gdn.data():nullptr,z.gdn) ||
+       !read(ss.ple_hist,expected ? expected->ple.data():nullptr,ss.ple_hist ? z.ple:0)) return false;
+    for(size_t j=0;j<owned_qsa(ss);++j) {
+        const auto& st=owned(ss,j);
+        if(!read(st.idx_tail,expected ? expected->tails.data()+j*z.tail:nullptr,z.tail) ||
+           !read(st.idx_dead,expected ? expected->dead.data()+j*z.dead:nullptr,z.dead) ||
+           !read(st.idx_block_pos,expected ? expected->block_pos.data()+j*z.block_pos:nullptr,z.block_pos)) return false;
+    }
+    hash.add(ss.ple_prev[0]);hash.add(ss.ple_prev[1]);hash.add(ss.ple_token);
+    if(expected) {
+        const auto& ids=expected->ids;
+        if(ss.ple_prev[0]!=(ids.size()>=2 ? ids[ids.size()-2]:-1) ||
+           ss.ple_prev[1]!=(ids.empty() ? -1:ids.back())) return fail(error,"restored PLE predecessor differs");
+    }
+    return true;
+}
+}
+bool conversation_snapshot_verify(const SavedConversation& image,const SessionState& ss,const ModelGeometry& g,
+                                  uint64_t& fingerprint,std::string& error) {
+    if(!conversation_snapshot_validate(image,ss,g,nullptr,error) || !sync(error)) return false;
+    core::ProofHash h;
+    if(!proof_running(&image.live,ss,g,h,error)) return false;
+    for(size_t j=0;j<owned_qsa(ss);++j) {
+        uint64_t kv=0;
+        if(!conversation_kv_verify(image.kv[j],owned(ss,j),g,image.live.ids.size(),true,kv,error)) return false;
+        h.add(kv);
+    }
+    fingerprint=h.value;return true;
+}
+bool conversation_live_fingerprint(const SessionState& ss,const ModelGeometry& g,int64_t upto,
+                                   uint64_t& fingerprint,std::string& error) {
+    if(!sync(error)) return false;
+    core::ProofHash h;
+    if(!proof_running(nullptr,ss,g,h,error)) return false;
+    std::array<uint8_t,65536> buffer;
+    for(size_t j=0;j<owned_qsa(ss);++j) {
+        SessionKvSource source;
+        if(!conversation_kv_source(source,owned(ss,j),g,upto,true,error)) return false;
+        h.add(source.format);h.add(source.cells);h.add(source.pooled_rows);
+        for(size_t part=0;part<source.sizes.size();++part) {
+            h.add(source.sizes[part]);
+            for(uint64_t at=0;at<source.sizes[part];) {
+                const size_t bytes=size_t(std::min<uint64_t>(buffer.size(),source.sizes[part]-at));
+                if(!source.read(part,at,buffer.data(),bytes)) { error=source.error();return false; }
+                h.raw(buffer.data(),bytes);at+=bytes;
+            }
+        }
+    }
+    fingerprint=h.value;return true;
 }
 
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,

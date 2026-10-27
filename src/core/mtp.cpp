@@ -1,6 +1,8 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/proof_hash.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
 
@@ -519,6 +521,12 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         !mapped((size_t) max_t_ * (size_t) kSpecQStride * sizeof(int32_t), (void**) &h_q_, (void**) &m_q_)) {
         err = "mtp: the draft distributions' buffer does not fit";
         return false;
+    }
+    // A prefill pause can precede the first coupled_draft_stage. Keep the
+    // typed captured sampler well-defined even while these records are idle.
+    const strata::kernels::SamplerParams initial{};
+    if(cudaMemcpy(cparams_,&initial,sizeof(initial),cudaMemcpyHostToDevice)!=cudaSuccess) {
+        err="mtp: coupled sampler initialization failed";return false;
     }
     cudaMemset(cring_, 0xff, ring);   // -1: no token
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
@@ -1104,6 +1112,173 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+}
+
+std::array<int64_t,13> MtpDrafter::request_geometry() const {
+    if (!g_) return {};
+    return {max_t_,g_->hc*g_->n_embd,g_->n_head,window_,st_.max_cells,cap_,n_vocab_,n_dvocab_,
+            hnorm_stream_,q4_,q4_head_,h_cparams_!=nullptr,h_q_!=nullptr};
+}
+
+bool MtpDrafter::request_bytes(int64_t extent,size_t& bytes,std::string& error) const {
+    if (!g_ || !window_R_ || max_t_<1 || max_t_>8 || force_on_ || chain_live_ ||
+        (src_R_ && src_R_!=window_R_) || extent<=0 || extent>st_.max_cells || prompt_len_<=0) {
+        error="mtp: request capture requires a bound drained serial drafter"; return false;
+    }
+    const size_t kv=conversation_kv_bytes(st_,*g_,extent,false);
+    if (!kv) { error="mtp: invalid request K/V extent"; return false; }
+    const uint64_t T=uint64_t(max_t_), HCN=uint64_t(g_->hc*g_->n_embd), NH=uint64_t(g_->n_head);
+    // All host/device staging and residual copies, including the bound verifier
+    // rows, plus directories. No weight or graph allocation is included.
+    const uint64_t words=2*T + 16*T + 4*T*NH + 6 + 2*T+4 + 2*T+4 + 3*T*HCN +
+        (h_cparams_ ? 2*kCoupledHistCap+T : 0) + (h_q_ ? T*kSpecQStride : 0) +
+        top2_.capacity()+lg_host_.capacity();
+    if (words>(SIZE_MAX-kv-sizeof(MtpRequestState)-2*sizeof(kernels::SamplerParams))/4) {
+        error="mtp: request byte estimate overflow"; return false;
+    }
+    bytes=kv+sizeof(MtpRequestState)+2*sizeof(kernels::SamplerParams)+size_t(words)*4;
+    return true;
+}
+
+bool MtpDrafter::request_capture(MtpRequestState& out,int64_t extent,std::string& error) {
+    size_t estimate=0;
+    if (!request_bytes(extent,estimate,error)) return false;
+    const OnDevice on_device(device_);
+    if (!idle(error) || cudaDeviceSynchronize()!=cudaSuccess) { error="mtp: capture drain failed"; return false; }
+    MtpRequestState image;
+    image.geometry=request_geometry(); image.prompt_len=prompt_len_; image.kv_extent=extent;
+    image.max_drafts=max_drafts_; image.coupled=coupled_active_;
+    image.ms_draft=ms_draft; image.ms_prefill=ms_prefill; image.rounds=rounds;
+    const size_t T=size_t(max_t_), HCN=size_t(g_->hc*g_->n_embd), NH=size_t(g_->n_head);
+    auto host=[&](auto& v,const auto* p,size_t n) {
+        v.resize(n); if (n) std::memcpy(v.data(),p,n*sizeof(*p));
+    };
+    auto device=[&](auto& v,const auto* p,size_t n) {
+        v.resize(n);
+        if (n && (!p || cudaMemcpy(v.data(),p,n*sizeof(*p),cudaMemcpyDeviceToHost)!=cudaSuccess)) {
+            error="mtp: request readback failed"; return false;
+        }
+        return true;
+    };
+    host(image.host_tokens,h_tok_,T); host(image.host_steps,h_step_,8*T);
+    host(image.host_positions,h_pos_,2*T*NH); host(image.host_row,h_row_,2);
+    host(image.host_out,h_out_,T); host(image.host_prob,h_prob_,T);
+    if (!device(image.device_tokens,tok_,T) || !device(image.device_steps,step_,8*T) ||
+        !device(image.device_positions,pos_,2*T*NH) || !device(image.device_row,row_,4) ||
+        !device(image.device_out,out_ids_,T+4) || !device(image.device_prob,probs_,T+4) ||
+        !device(image.input_R,Rin_,T*HCN) || !device(image.residual_R,R_,T*HCN) ||
+        !device(image.window_R,window_R_,T*HCN)) return false;
+    if (h_cparams_) {
+        std::memcpy(&image.sampling,h_cparams_,sizeof(image.sampling));
+        host(image.history,h_chist_,kCoupledHistCap);
+        if (cudaMemcpy(&image.device_sampling,cparams_,sizeof(*cparams_),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+            !device(image.ring,cring_,kCoupledHistCap+T)) {
+            error="mtp: coupled request readback failed"; return false;
+        }
+    }
+    if (h_q_) host(image.q,h_q_,T*kSpecQStride);
+    image.top2=top2_; image.debug_logits=lg_host_;
+    if (!conversation_kv_save(image.kv,st_,*g_,extent,false,error) ||
+        !request_validate(image,prompt_len_,extent,error)) return false;
+    out=std::move(image);
+    return true;
+}
+
+bool MtpDrafter::request_validate(const MtpRequestState& image,int64_t prompt,int64_t extent,
+        std::string& error) const {
+    size_t ignored=0;
+    if (!request_bytes(extent,ignored,error) || !image.validate_layout(request_geometry(),prompt,extent,error)) return false;
+    if (!h_tok_ || !h_step_ || !h_pos_ || !h_row_ || !h_out_ || !h_prob_ ||
+        !tok_ || !step_ || !pos_ || !row_ || !out_ids_ || !probs_ || !Rin_ || !R_ ||
+        (h_cparams_ && (!cparams_ || !h_chist_ || !cring_))) {
+        error="mtp: request restore buffer missing"; return false;
+    }
+    return conversation_kv_validate(image.kv,st_,*g_,extent,false,error);
+}
+
+bool MtpDrafter::request_restore(const MtpRequestState& image,SessionState& session,std::string& error) {
+    if (!request_validate(image,image.prompt_len,image.kv_extent,error)) return false;
+    // Allocate diagnostics before any destination write. Every graph still binds
+    // the same working addresses; only request data is written back to them.
+    auto top2=image.top2; auto debug_logits=image.debug_logits;
+    const OnDevice on_device(device_);
+    if (!idle(error) || cudaDeviceSynchronize()!=cudaSuccess) { error="mtp: restore drain failed"; return false; }
+    auto host=[](auto* p,const auto& v) { if (!v.empty()) std::memcpy(p,v.data(),v.size()*sizeof(*p)); };
+    auto device=[&](auto* p,const auto& v) {
+        if (!v.empty() && cudaMemcpy(p,v.data(),v.size()*sizeof(*p),cudaMemcpyHostToDevice)!=cudaSuccess) {
+            error="mtp: request restore transfer failed"; return false;
+        }
+        return true;
+    };
+    if (!conversation_kv_restore(image.kv,st_,*g_,image.kv_extent,false,error) ||
+        !device(tok_,image.device_tokens) || !device(step_,image.device_steps) ||
+        !device(pos_,image.device_positions) || !device(row_,image.device_row) ||
+        !device(out_ids_,image.device_out) || !device(probs_,image.device_prob) ||
+        !device(Rin_,image.input_R) || !device(R_,image.residual_R) ||
+        !device(const_cast<float*>(window_R_),image.window_R)) return false;
+    if (h_cparams_ && (cudaMemcpy(cparams_,&image.device_sampling,sizeof(*cparams_),cudaMemcpyHostToDevice)!=cudaSuccess ||
+        !device(cring_,image.ring))) { error="mtp: coupled request restore failed"; return false; }
+    host(h_tok_,image.host_tokens); host(h_step_,image.host_steps); host(h_pos_,image.host_positions);
+    host(h_row_,image.host_row); host(h_out_,image.host_out); host(h_prob_,image.host_prob);
+    if (h_cparams_) { std::memcpy(h_cparams_,&image.sampling,sizeof(image.sampling)); host(h_chist_,image.history); }
+    if (h_q_) host(h_q_,image.q);
+    if (cudaDeviceSynchronize()!=cudaSuccess) { error="mtp: restored request did not drain"; return false; }
+    prompt_len_=image.prompt_len; max_drafts_=image.max_drafts; coupled_active_=image.coupled;
+    top2_=std::move(top2); lg_host_=std::move(debug_logits);
+    ms_draft=image.ms_draft; ms_prefill=image.ms_prefill; rounds=image.rounds;
+    ss_=&session; ple_ss_=&session; src_R_=nullptr; // serial, graph-backed working buffers rebound explicitly
+    return true;
+}
+
+bool MtpDrafter::request_verify(const MtpRequestState& image,uint64_t& fingerprint,std::string& error,bool restored_residency) const {
+    if(!request_validate(image,image.prompt_len,image.kv_extent,error)) return false;
+    const OnDevice on_device(device_);
+    if(cudaDeviceSynchronize()!=cudaSuccess) { error="mtp: proof drain failed";return false; }
+    ProofHash h;
+    if(prompt_len_!=image.prompt_len || max_drafts_!=image.max_drafts || coupled_active_!=image.coupled ||
+       rounds!=image.rounds || ms_draft!=image.ms_draft || ms_prefill!=image.ms_prefill ||
+       top2_!=image.top2 || lg_host_.size()!=image.debug_logits.size() ||
+       (!lg_host_.empty() && std::memcmp(lg_host_.data(),image.debug_logits.data(),lg_host_.size()*4))) {
+        error="mtp: restored scalar/diagnostic state differs";return false;
+    }
+    h.add(image.geometry);h.add(prompt_len_);h.add(max_drafts_);h.add(coupled_active_);h.add(rounds);
+    std::array<uint8_t,65536> buffer;
+    auto compare=[&](const auto* source,const auto& saved) {
+        const size_t n=saved.size()*sizeof(*source);h.add(n);
+        if(n && !source) { error="mtp: proof buffer missing";return false; }
+        const auto* expected=reinterpret_cast<const uint8_t*>(saved.data());
+        for(size_t at=0;at<n;) {
+            const size_t bytes=std::min(buffer.size(),n-at);
+            if(cudaMemcpy(buffer.data(),reinterpret_cast<const uint8_t*>(source)+at,bytes,cudaMemcpyDefault)!=cudaSuccess ||
+               std::memcmp(buffer.data(),expected+at,bytes)) { error="mtp: restored buffer bytes differ";return false; }
+            h.raw(buffer.data(),bytes);at+=bytes;
+        }
+        return true;
+    };
+    if(!compare(h_tok_,image.host_tokens) || !compare(h_step_,image.host_steps) ||
+       !compare(h_pos_,image.host_positions) || !compare(h_row_,image.host_row) ||
+       !compare(h_out_,image.host_out) || !compare(h_prob_,image.host_prob) ||
+       !compare(tok_,image.device_tokens) || !compare(step_,image.device_steps) ||
+       !compare(pos_,image.device_positions) || !compare(row_,image.device_row) ||
+       !compare(out_ids_,image.device_out) || !compare(probs_,image.device_prob) ||
+       !compare(Rin_,image.input_R) || !compare(R_,image.residual_R) ||
+       !compare(window_R_,image.window_R)) return false;
+    if(h_cparams_) {
+        kernels::SamplerParams params{};
+        if(cudaMemcpy(&params,cparams_,sizeof(params),cudaMemcpyDeviceToHost)!=cudaSuccess) {
+            error="mtp: proof sampler readback failed";return false;
+        }
+        ProofHash a,b,c,d;a.add(params);b.add(image.device_sampling);c.add(*h_cparams_);d.add(image.sampling);
+        if(a.value!=b.value || c.value!=d.value || !compare(h_chist_,image.history) || !compare(cring_,image.ring)) {
+            error="mtp: restored sampler/history differs";return false;
+        }
+        h.add(a.value);h.add(c.value);
+    }
+    if(h_q_ && !compare(h_q_,image.q)) return false;
+    h.add(top2_);h.add(lg_host_);
+    uint64_t kv=0;
+    if(!conversation_kv_verify(image.kv,st_,*g_,image.kv_extent,false,kv,error,restored_residency)) return false;
+    h.add(kv);fingerprint=h.value;return true;
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {

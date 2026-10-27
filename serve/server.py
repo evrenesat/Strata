@@ -58,6 +58,9 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.priority_scheduler import (PriorityScheduler, Role, PriorityProtocolError,  # noqa: E402
+                                      PriorityUnavailable, PriorityQueueFull)
+from serve.priority_auth import configured_auth, validate_chat  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -552,6 +555,48 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 
 
+def _request_field(name, default=None):
+    """Priority request metrics follow their consumer thread, like DONE usage."""
+    def get(engine):
+        if getattr(engine, 'priority', None):
+            local=engine.__dict__.setdefault('_priority_metrics',threading.local())
+            return getattr(local,name,default)
+        return engine.__dict__.get('_metric_'+name,default)
+    def set_value(engine,value):
+        if getattr(engine, 'priority', None):
+            local=engine.__dict__.setdefault('_priority_metrics',threading.local())
+            setattr(local,name,value)
+        else:
+            engine.__dict__['_metric_'+name]=value
+    return property(get,set_value)
+
+
+def priority_preheader_queue_full(svc) -> bool:
+    """The count-bound pre-header check for streaming requests.  An already-admitted VIP
+    reservation bypasses it: its admission is atomic and pre-header by construction
+    (reserve_priority submits before any headers), so the check only ever refuses ordinary
+    background submissions.  For those it is a best-effort snapshot taken before headers; a
+    concurrent admission that slips past it degrades to the machine-readable in-stream
+    priority_queue_full event, never to a wrong 503 for an admitted request."""
+    if getattr(getattr(svc, '_priority_role', None), 'reservation', None) is not None:
+        return False
+    return bool(getattr(svc.engine, 'priority_queue_full', lambda: False)())
+
+
+def sse_keepalive(engine) -> bytes:
+    """The SSE comment written between events: a priority status note when the engine
+    reported one for this request's thread (e.g. a parked request whose resume the engine
+    refused), else the plain keep-alive.  Notes are scheduler-composed tokens, no secrets."""
+    note = getattr(engine, 'stream_note', None)
+    if note:
+        try:
+            engine.stream_note = None
+        except Exception:
+            pass
+        return f": {note}\n\n".encode()
+    return b": keep-alive\n\n"
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -564,12 +609,17 @@ class StrataEngine:
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    progress = _request_field('progress')
+    progress_ms = _request_field('progress_ms',0)
+    reused = _request_field('reused',0)
+    prefill_tok_s_mean = _request_field('prefill_tok_s_mean')
+    stream_note = _request_field('stream_note')   # one pending priority status note for the SSE comments
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
     @property
     def last(self):
-        if self.batch:
+        if self.batch or getattr(self, 'priority', None):
             tl = self.__dict__.setdefault("_tl", threading.local())
             if not hasattr(tl, "last"):
                 tl.last = {}
@@ -579,13 +629,24 @@ class StrataEngine:
     @last.setter
     def last(self, value):
         self.__dict__["_last"] = value
-        if self.batch:
+        if self.batch or getattr(self, 'priority', None):
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False):
+                 env: dict | None = None, lazy: bool = False,
+                 priority_queue_limits: tuple[int, int] | None = None,
+                 priority_resume_retry_deadline_seconds: int | None = None,
+                 silence_s: float | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
+        self.priority_configured = '--priority-serving' in args
+        self.priority = None
+        # Bounded queue admission for priority mode (the config's priority section may set
+        # both; see priority_queue_limits): queued requests at most, and their command bytes.
+        # Passed in at construction so a non-lazy startup's scheduler sees the configured
+        # values immediately; restart() keeps them because they live on self.
+        self.priority_queue_limits = priority_queue_limits or (64, 8 * 1024 * 1024)
+        self.priority_resume_retry_deadline_seconds = priority_resume_retry_deadline_seconds
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -720,14 +781,34 @@ class StrataEngine:
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
+        if '--priority-serving' in args:
+            if self.batch or self.info.get('priority_protocol') != 1:
+                self.close()
+                raise ValueError('priority mode requires the matching serial native protocol')
+            owned_proc=self.proc
+            limits = self.priority_queue_limits
+            deadline = self.priority_resume_retry_deadline_seconds
+            configured = silence_s if silence_s is not None else self.silence_s
+            # engine_silence_s: 0 means "wait forever" - an infinite allowance, not 120.
+            self.priority = PriorityScheduler(self._send,
+                silence_seconds=math.inf if configured == 0 else float(configured or 120),
+                max_queued_requests=limits[0], max_queued_command_bytes=limits[1],
+                resume_retry_deadline_seconds=deadline if deadline is not None else 300,
+                fatal=lambda error:self._priority_fatal(error,owned_proc))
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        priority = self.priority
         line = None
         for line in proc.stdout:
+            if priority:
+                priority.feed(line)
+                if priority.dead:
+                    break
+                continue
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -752,6 +833,8 @@ class StrataEngine:
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
+        if priority:
+            priority.feed(None)
         for q in slot_q:
             q.put(None)
 
@@ -825,6 +908,10 @@ class StrataEngine:
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
         info = dict(self.info)
+        # The priority bounds live on self so a plain restart() keeps them; __init__ would
+        # otherwise reset them to the defaults on the re-run below.
+        priority_limits, priority_deadline = self.priority_queue_limits, self.priority_resume_retry_deadline_seconds
+        restart_silence = self.silence_s
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
             self.close()
@@ -834,7 +921,9 @@ class StrataEngine:
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)
+                    self.__init__(*self.spawn, priority_queue_limits=priority_limits,
+                                  priority_resume_retry_deadline_seconds=priority_deadline,
+                                  silence_s=restart_silence)
                     break
                 except RuntimeError:
                     try:
@@ -874,6 +963,8 @@ class StrataEngine:
         expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
         started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
+        if getattr(self, 'priority', None):
+            raise ValueError('VRAM control is unavailable in priority mode')
         if not self.alive():
             raise EngineDied("the engine is not running")
         self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
@@ -1424,12 +1515,136 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def _priority_fatal(self, error, proc):
+        if self.proc is proc:
+            self.silent_note = str(error)
+            self.ended = True
+        if proc is not None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    def _priority_command(self, ids, max_new, sampling, embeddings):
+        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        return f"{head} {','.join(str(int(t)) for t in ids)}"
+
+    def reserve_priority(self, ids, max_new, sampling, cancel, embeddings=None, arrival=None, timeout=180,
+                         turn=None):
+        """Internal pre-header foreground admission; submit/renew exactly once."""
+        scheduler=self.priority
+        if not scheduler or not 0<timeout<=180:
+            raise ValueError('foreground reservation requires enabled bounded priority')
+        r=scheduler.submit(self._priority_command(ids,max_new,sampling,embeddings),Role.HERMES,arrival,turn)
+        deadline=time.monotonic()+timeout
+        try:
+            while not r.admitted.wait(.1):
+                if cancel.is_set() or time.monotonic()>=deadline:
+                    raise PriorityUnavailable('priority_unavailable; retry after 5 seconds')
+            if r.failure:
+                raise r.failure
+            if r.terminal and r.terminal.startswith('ERR '):
+                raise ValueError(r.terminal[4:])
+            if cancel.is_set():
+                raise PriorityUnavailable('priority reservation cancelled before headers')
+            return r
+        except BaseException:
+            self.release_priority(r)
+            raise
+
+    def priority_queue_full(self):
+        """Pre-header count check for streaming requests in priority mode (finding 5)."""
+        scheduler = getattr(self, 'priority', None)
+        return bool(scheduler) and scheduler.queue_full()
+
+    def release_priority(self, r):
+        scheduler=r.origin
+        if not isinstance(scheduler,PriorityScheduler):
+            raise PriorityProtocolError('missing original request scheduler')
+        if r.state not in ('done','failed'):
+            scheduler.cancel(r)
+            deadline=time.monotonic()+181
+            while r.state not in ('done','failed') and time.monotonic()<deadline:
+                try:r.events.get(timeout=.2)
+                except queue.Empty:pass
+            if r.state not in ('done','failed'):
+                scheduler.fail(PriorityProtocolError('priority cancellation deadline exceeded'))
+        scheduler.release(r)
+
+    def generate_priority(self, ids, max_new, sampling, cancel, embeddings, role, arrival, reservation, turn):
+        scheduler = self.priority
+        command=self._priority_command(ids,max_new,sampling,embeddings)
+        if reservation is None:
+            try:
+                r = scheduler.submit(command,role,arrival,turn)
+            except PriorityProtocolError as error:
+                raise EngineDied(str(error)) from None
+        else:
+            r=reservation
+            with scheduler.lock:
+                if (scheduler.requests.get(r.id) is not r or r.command!=command or r.claimed or
+                        role is not Role.HERMES or r.role is not role):
+                    raise ValueError('foreign, duplicate or mismatched foreground reservation')
+                r.claimed=True
+        done, beat = False, time.monotonic()
+        self.last = {}
+        self.progress, self.progress_ms, self.reused = None,0,0
+        try:
+            while True:
+                if cancel.is_set():
+                    scheduler.cancel(r)
+                try:
+                    line = r.events.get(timeout=.2)
+                except queue.Empty:
+                    if time.monotonic()-beat >= 10:
+                        beat = time.monotonic()
+                        yield None  # Transport bytes only; never an engine progress beat.
+                    continue
+                if isinstance(line, Exception):
+                    done = True
+                    raise line
+                if line.startswith('T '):
+                    yield int(line.split()[1])
+                elif line.startswith('WAIT '):
+                    # The scheduler's status for a waiting (parked) request, e.g. a resume the
+                    # engine refused: heartbeat at once and let the SSE layer carry the note.
+                    self.stream_note = line[5:].strip()
+                    beat = time.monotonic()
+                    yield None
+                    continue
+                elif line.startswith('DONE '):
+                    self._parse_done(line)
+                    done = True
+                    break
+                elif line.startswith('ERR '):
+                    done = True
+                    raise ValueError(line[4:].strip())
+                elif line.startswith('PP '):
+                    fields = line.split()
+                    self.progress = int(fields[1]), int(fields[2])
+                    self.progress_ms = float(fields[3])
+                elif line.startswith('REUSED '):
+                    self.reused = int(line.split()[1])
+                if time.monotonic()-beat >= 10:
+                    beat = time.monotonic()
+                    yield None
+        except PriorityProtocolError as error:
+            raise EngineDied(str(error)) from None
+        finally:
+            self.release_priority(r)
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, _priority_role=Role.BACKGROUND,
+                 _priority_arrival=None, _priority_reservation=None, _priority_turn=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        if getattr(self, 'priority', None):
+            yield from self.generate_priority(ids, max_new, sampling, cancel, embeddings, _priority_role,
+                                              _priority_arrival, _priority_reservation, _priority_turn)
+            return
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -1561,6 +1776,8 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
+        if getattr(self, 'priority', None):
+            raise ValueError('session controls are unavailable in priority mode')
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
@@ -1651,6 +1868,8 @@ class StrataEngine:
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
         a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        if getattr(self, 'priority', None):
+            self.priority.close()
         if self.proc is None:
             return
         try:
@@ -2007,6 +2226,40 @@ def engine_silence_s(cfg: dict) -> float:
     return float(v)
 
 
+PRIORITY_MAX_QUEUED_REQUESTS = 64                    # priority."max_queued_requests"
+PRIORITY_MAX_QUEUED_COMMAND_BYTES = 8 * 1024 * 1024  # priority."max_queued_command_bytes"
+
+
+def priority_resume_retry_deadline(cfg: dict) -> int:
+    """The priority section's optional resume_retry_deadline_seconds: how long a parked
+    request's refused resumes keep retrying (5 s interval) before the request fails with
+    priority_resume_refused_persistent and its capsule is retired.  5..86400 s."""
+    priority = cfg.get('priority')
+    if priority is None:
+        return 300
+    seconds = priority.get('resume_retry_deadline_seconds', 300)
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or not 5 <= seconds <= 86400:
+        raise ValueError('"priority"."resume_retry_deadline_seconds" must be a whole number '
+                         f'5..86400, not {seconds!r}')
+    return seconds
+
+
+def priority_queue_limits(cfg: dict) -> tuple[int, int]:
+    """The priority section's optional queue bounds: how many requests may sit queued and how many
+    command bytes they may hold in total before a new submission is refused with 503
+    priority_queue_full (Retry-After 5).  Running and parked requests never count toward either."""
+    priority = cfg.get('priority')
+    if priority is None:
+        return PRIORITY_MAX_QUEUED_REQUESTS, PRIORITY_MAX_QUEUED_COMMAND_BYTES
+    counts = priority.get('max_queued_requests', PRIORITY_MAX_QUEUED_REQUESTS)
+    bytes_ = priority.get('max_queued_command_bytes', PRIORITY_MAX_QUEUED_COMMAND_BYTES)
+    for name, v in (('"priority"."max_queued_requests"', counts),
+                    ('"priority"."max_queued_command_bytes"', bytes_)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError(f'{name} must be a whole number >= 1, not {v!r}')
+    return counts, bytes_
+
+
 def layer_split_value(cfg: dict) -> str:
     """#644: the config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
     each later GPU's share - one rising number per GPU after the first, e.g. "24,36,42" for 4 GPUs (layers 0-23 on the
@@ -2064,6 +2317,18 @@ def engine_args(cfg: dict) -> list[str]:
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
+    priority = cfg.get('priority', {})
+    if not isinstance(priority, dict):
+        raise ValueError('priority must be an object')
+    if priority.get('idle_backfill'):
+        raise ValueError('idle backfill requires trusted profile-bound measured admission')
+    priority_queue_limits(cfg)   # the optional queue bounds are validated before launch, too
+    priority_resume_retry_deadline(cfg)   # and the resume retry deadline with them
+    if priority.get('enabled') or '--priority-serving' in args:
+        if any(k in args for k in ('--batch', '--slots', '--layer-split', '--pipeline-windows', '--lookup-chain')):
+            raise ValueError('priority requires a serial single-GPU engine')
+        if '--priority-serving' not in args:
+            args.append('--priority-serving')
     return learned_profile_args(cfg, args)
 
 
@@ -2398,9 +2663,11 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
+        self._priority_role = threading.local()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.priority_auth = None                      # explicit protected map; no HTTP role labels
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
@@ -2457,6 +2724,62 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
+    @contextlib.contextmanager
+    def trusted_priority_role(self, role, arrival=None):
+        """Internal role boundary; HTTP fields and headers cannot populate it."""
+        if not isinstance(role, Role):
+            raise ValueError('trusted role must be a Role enum')
+        previous = getattr(self._priority_role, 'value', Role.BACKGROUND)
+        previous_arrival = getattr(self._priority_role, 'arrival', None)
+        previous_turn = getattr(self._priority_role, 'turn', None)
+        self._priority_role.value = role
+        self._priority_role.arrival = (time.monotonic() if arrival is None else arrival) if role is Role.HERMES else None
+        self._priority_role.turn = None
+        try:
+            yield
+        finally:
+            turn=self._priority_role.turn
+            if turn is not None:
+                turn.origin.end_turn(turn)
+            self._priority_role.value = previous
+            self._priority_role.arrival = previous_arrival
+            self._priority_role.turn = previous_turn
+
+    def _foreground_turn(self):
+        if getattr(self._priority_role,'value',Role.BACKGROUND) is not Role.HERMES:
+            return None
+        turn=getattr(self._priority_role,'turn',None)
+        if turn is None:
+            turn=self.engine.priority.begin_turn(self._priority_role.arrival)
+            self._priority_role.turn=turn
+        return turn
+
+    @contextlib.contextmanager
+    def foreground_reservation(self, ids, max_new, sampling, cancel, timeout=180):
+        """CP4 contract: authenticate and validate first, enter BEFORE _sse.
+
+        Catch PriorityUnavailable as HTTP503/Retry-After5 before committing any
+        headers. Keep this scope around the SAME Service.run stream; later native
+        failures end that stream honestly. No HTTP role source is added here.
+        """
+        if getattr(self._priority_role,'value',Role.BACKGROUND) is not Role.HERMES:
+            raise ValueError('foreground reservation requires a trusted Hermes role')
+        if getattr(self._priority_role,'reservation',None) is not None:
+            raise ValueError('foreground reservation already exists')
+        defaults={**self.sampling_defaults,**self.shared}
+        values={k:v for k,v in (sampling or {}).items() if v is not None}
+        effective={**defaults,**values} if defaults else sampling
+        with self.fifo:self.ensure_loaded()
+        r=self.engine.reserve_priority(ids,max_new,effective,cancel,
+            embeddings=getattr(self.embeddings,'path',None),arrival=self._priority_role.arrival,timeout=timeout,
+            turn=self._foreground_turn())
+        self._priority_role.reservation=r
+        try:
+            yield r
+        finally:
+            self._priority_role.reservation=None
+            self.engine.release_priority(r)
+
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
@@ -2465,6 +2788,8 @@ class Service:
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
+        if getattr(self.engine, "priority", None):
+            return error(501, 'slot save/restore is unavailable in priority mode')
         if getattr(self.engine, "batch", 0):
             # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
             # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
@@ -3248,14 +3573,15 @@ class Service:
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        par = bool(getattr(self.engine, "batch", 0))
+        par = bool(getattr(self.engine, "batch", 0) or getattr(self.engine, 'priority', None) or
+                   getattr(self.engine,'priority_configured',False))
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
-            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
+            with (contextlib.nullcontext() if par else self.fifo):
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -3282,8 +3608,16 @@ class Service:
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        if getattr(self.engine, 'priority', None):
+                            reservation=getattr(self._priority_role,'reservation',None)
+                            self._priority_role.reservation=None  # only the first native segment claims it
+                            gen = self.engine.generate(prompt, max_new-n, sampling, cancel, embeddings=emb,
+                                _priority_role=getattr(self._priority_role, 'value', Role.BACKGROUND),
+                                _priority_arrival=getattr(self._priority_role,'arrival',None),
+                                _priority_reservation=reservation,_priority_turn=self._foreground_turn())
+                        else:
+                            gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
+                                else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
@@ -4187,7 +4521,7 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, headers=None):
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -4199,22 +4533,40 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            for name,value in (headers or {}).items():self.send_header(name,value)
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def _given_key(self):
+            auth=self.headers.get("Authorization", "")
+            return auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+
+        def _restricted(self):
+            mapping=svc.priority_auth
+            role=mapping.role(self._given_key()) if mapping is not None else None
+            if role is Role.HERMES and not mapping.allowed(self.command,self.path):
+                self._json(403, {"error":{"type":"permission_error","message":"credential cannot access this operation"}})
+                return True
+            return False
+
         def _authorized(self) -> bool:
+            self.request_role=Role.BACKGROUND
             if not svc.api_key:
                 return True
-            auth = self.headers.get("Authorization", "")
-            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            given=self._given_key()
+            if key_matches(given,svc.api_key):return True
+            mapping=svc.priority_auth
+            if mapping is not None and mapping.role(given) is Role.HERMES:
+                if self._restricted():return False
+                self.request_role=Role.HERMES
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
         def do_GET(self):
+            if self._restricted():return
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
@@ -4362,6 +4714,7 @@ def make_handler(svc: Service):
         def _post(self):
             if not self._authorized():
                 return
+            self.model_arrival=time.monotonic()
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
@@ -4458,6 +4811,14 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except PriorityQueueFull:
+                self._json(503,{"error":{"type":"priority_queue_full","code":"priority_queue_full",
+                                       "message":"the priority queue is full; retry after 5 seconds"}},
+                           headers={"Retry-After":"5"})
+            except PriorityUnavailable as e:
+                self._json(503,{"error":{"type":"priority_unavailable",
+                                       "code":getattr(e,"code","priority_unavailable"),
+                                       "message":str(e) or "foreground admission unavailable"}},headers={"Retry-After":"5"})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -4651,6 +5012,7 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
+            self.wfile.flush()  # Header bytes reach a paused client before its first event.
 
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
@@ -4693,6 +5055,8 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            role=getattr(self,'request_role',Role.BACKGROUND)
+            if role is Role.HERMES:validate_chat(req,svc.model_names())
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
@@ -4720,6 +5084,15 @@ def make_handler(svc: Service):
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
+            with svc.trusted_priority_role(role,arrival=getattr(self,'model_arrival',None)):
+                reservation=(svc.foreground_reservation(ids,max_new,req,cancel)
+                             if role is Role.HERMES else contextlib.nullcontext())
+                with reservation:
+                    return self._openai_response(req,messages,tools,kw,ids,thinking,max_new,max_req,
+                                                 use_mcp,extra if use_mcp else [],force,validator,cancel)
+
+        def _openai_response(self,req,messages,tools,kw,ids,thinking,max_new,max_req,
+                             use_mcp,extra,force,validator,cancel):
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
@@ -4728,11 +5101,16 @@ def make_handler(svc: Service):
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
+            if priority_preheader_queue_full(svc):
+                # Pre-header admission (count bound): a queued-slot shortage is refused as a
+                # real HTTP 503 with a machine-readable code, not as an in-stream event the
+                # client may treat as the model's answer (the byte bound stays at submit).
+                raise PriorityQueueFull('priority_queue_full; retry after 5 seconds')
             self._sse()
             try:
                 for c in chunks:
                     if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        self.wfile.write(sse_keepalive(svc.engine))   # an SSE comment: clients ignore it
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
@@ -4741,8 +5119,15 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
-            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+            except (EngineDied,PriorityUnavailable) as e:                          # mid-stream: say so, then end the stream properly
+                if isinstance(e, PriorityQueueFull):   # the byte bound at submit time: a machine-readable code
+                    err = {"error": {"type": "priority_queue_full", "code": "priority_queue_full",
+                                     "message": str(e)}}
+                elif isinstance(e, PriorityUnavailable):
+                    err = {"error": {"type": "priority_unavailable", "code": getattr(e, "code", "priority_unavailable"),
+                                     "message": str(e)}}
+                else:
+                    err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -4816,6 +5201,11 @@ def make_handler(svc: Service):
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
+            if priority_preheader_queue_full(svc):
+                # Pre-header admission (count bound): a queued-slot shortage is refused as a
+                # real HTTP 503 with a machine-readable code, not as an in-stream event the
+                # client may treat as the model's answer (the byte bound stays at submit).
+                raise PriorityQueueFull('priority_queue_full; retry after 5 seconds')
             self._sse()
             last = time.monotonic()
 
@@ -4832,7 +5222,7 @@ def make_handler(svc: Service):
                             send(asm.in_progress())
                             last = time.monotonic()
                         else:
-                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.write(sse_keepalive(svc.engine))
                     else:
                         send(e)
                         last = time.monotonic()
@@ -4841,6 +5231,10 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
+            except PriorityQueueFull as e:                   # mid-stream: response.failed with the queue code
+                self._responses_failed(asm, str(e), "priority_queue_full", send)
+            except PriorityUnavailable as e:                 # e.g. priority_resume_refused_persistent
+                self._responses_failed(asm, str(e), getattr(e, "code", "priority_unavailable"), send)
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
@@ -4938,11 +5332,16 @@ def make_handler(svc: Service):
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
+            if priority_preheader_queue_full(svc):
+                # Pre-header admission (count bound): a queued-slot shortage is refused as a
+                # real HTTP 503 with a machine-readable code, not as an in-stream event the
+                # client may treat as the model's answer (the byte bound stays at submit).
+                raise PriorityQueueFull('priority_queue_full; retry after 5 seconds')
             self._sse()
             try:
                 for item in events:
                     if item is None:
-                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.write(sse_keepalive(svc.engine))
                     else:
                         name, e = item
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
@@ -4952,6 +5351,15 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()
                 events.close()
+            except PriorityQueueFull as e:                   # mid-stream: Anthropic's error event, queue code
+                err = {"type": "error", "error": {"type": "api_error", "code": "priority_queue_full", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except PriorityUnavailable as e:                 # e.g. priority_resume_refused_persistent
+                err = {"type": "error", "error": {"type": "api_error", "code": getattr(e, "code", "priority_unavailable"),
+                                                  "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
@@ -5372,6 +5780,12 @@ def main() -> int:
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    # Validate protected roles before creating/loading an engine or vision encoder.
+    try:
+        priority_auth=configured_auth(cfg,api_key_of(a.api_key or cfg.get("api_key", "")))
+    except (OSError,ValueError,TypeError):
+        print("[strata] invalid protected priority credentials",file=sys.stderr)
+        return 2
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -5437,8 +5851,15 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
+        try:
+            # Both priority bounds are read before construction so the scheduler a non-lazy
+            # startup creates immediately sees the configured values.
+            queue_limits, resume_deadline = priority_queue_limits(cfg), priority_resume_retry_deadline(cfg)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
         engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
+                              env=env, lazy=lazy, priority_queue_limits=queue_limits,
+                              priority_resume_retry_deadline_seconds=resume_deadline, silence_s=silence)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
@@ -5478,6 +5899,7 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    svc.priority_auth=priority_auth
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
