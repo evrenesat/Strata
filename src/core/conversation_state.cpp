@@ -343,9 +343,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     return true;
 }
 
-bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
-                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
+namespace {
+// The capture every streamed source list shares: metadata for everything but the K/V, then one source per owned QSA
+// layer and, when this session owns a draft layer, its separate source.
+bool snapshot_sources_common(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                             const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                             const QsaState* draft, std::string& error) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -355,13 +358,26 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
-    std::vector<SessionKvSource> out(layers + 1);
+    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
-    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
     meta = std::move(captured);
     sources = std::move(out);
     return true;
+}
+}  // namespace
+
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState& draft, std::string& error) {
+    return snapshot_sources_common(meta, sources, view, ss, g, &draft, error);
+}
+
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState* draft, std::string& error) {
+    return snapshot_sources_common(meta, sources, view, ss, g, draft, error);
 }
 
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
@@ -411,6 +427,37 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
     return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
+}
+
+namespace {
+// The metadata checks a restore makes before any destination write, with the K/V layer count left to the caller: a
+// RAM image carries one resident entry per layer, a disk image carries none (its K/V is in the capsule file).
+bool snapshot_metadata_valid(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                             std::string& error) {
+    if (!image.live.stage_parts.empty())
+        return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
+    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    // an image holds exactly one carve's running state and K/V: same layer range or nothing
+    if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
+    return view_validate(view, ss, g, error) && conversation_checkpoint_validate(image.live, ss, g, error);
+}
+}  // namespace
+
+bool conversation_snapshot_validate_resident(const SavedConversation& image, const SessionState& ss,
+                                             const ModelGeometry& g, std::string& error) {
+    // A disk capsule holds no K/V payload: this proves the resident manifest only.  The caller proves the capsule's
+    // layers against the session's targets (conversation_kv_restore_source), before the first write, as always.
+    if (!snapshot_metadata_valid(image, ss, g, error)) return false;
+    if (!image.kv.empty()) return fail(error, "a disk capsule image must not carry resident K/V");
+    return true;
+}
+
+bool conversation_snapshot_restore_resident(const SavedConversation& image, SessionState& ss,
+                                            const ModelGeometry& g, std::string& error) {
+    // Exactly what the RAM restore does after its K/V calls: the running state and the checkpoints.
+    return conversation_checkpoint_restore(image.live, ss, g, error);
 }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
