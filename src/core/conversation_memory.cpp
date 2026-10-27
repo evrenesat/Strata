@@ -249,6 +249,55 @@ const char* memory_source_name(MemorySource source) {
     }
 }
 
+std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
+    return meminfo_kb_bytes(meminfo, "MemAvailable:");
+}
+
+void set_memory_limit_bytes(uint64_t bytes) { g_memory_limit_bytes.store(bytes, std::memory_order_relaxed); }
+uint64_t memory_limit_bytes() { return g_memory_limit_bytes.load(std::memory_order_relaxed); }
+
+std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& paths, uint64_t explicit_limit) {
+    std::ifstream avail_file(paths.meminfo);
+    if (!avail_file) return {};
+    const std::optional<uint64_t> available = conversation_mem_available(avail_file);
+    if (!available) return {};
+    std::ifstream total_file(paths.meminfo);
+    std::optional<uint64_t> total;
+    if (total_file) total = meminfo_kb_bytes(total_file, "MemTotal:");
+    CgroupScan cg;
+    if (!scan_cgroups(paths, cg)) {
+        // Without an operator cap the cgroup files are only an extra: the guard falls back to MemAvailable alone (what
+        // 0.1.41 used), once-warned.  With a cap the usage cannot be told, so the sample stays unknown.
+        if (explicit_limit != 0) return {};
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "[strata] memory guard: the cgroup memory files could not be read or parsed, using "
+                                 "MemAvailable; set --memory-limit-mib to the container's limit\n");
+        cg = CgroupScan{};
+    }
+    return combine(available, total, cg, explicit_limit);
+}
+
+std::optional<HostMemoryReading> sample_host_memory() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof status;
+    // #1607: the commit limit (RAM + page file) refuses an allocation while physical RAM is still free
+    if (!GlobalMemoryStatusEx(&status)) return {};
+    return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
+#elif defined(__linux__)
+    return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+#else
+    return {};
+#endif
+}
+
+std::optional<uint64_t> available_host_bytes() {
+    const auto reading = sample_host_memory();
+    if (!reading) return {};
+    return reading->available;
+}
+
 // Parked-capsule/priority spill admission: the strict fail-closed cgroup view (fork feature,
 // kept beside the upstream sampler: an unreadable discovered cgroup fails admission closed
 // instead of falling back to MemAvailable).
@@ -301,6 +350,47 @@ std::optional<uint64_t> conversation_cgroup_memory_value(std::istream& file) {
     if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) return {};
     if (bytes >= cgroup_no_limit) return std::numeric_limits<uint64_t>::max();
     return bytes;
+}
+
+// The credit is a reclamation estimate, so every unusable input withdraws it completely: a
+// missing key, a repeated key, a token that is not strict unsigned decimal, or an I/O failure
+// all return no value and the caller keeps the older, fully conservative bound.
+std::optional<uint64_t> conversation_cgroup_memory_credit(std::istream& stat, uint64_t usage,
+                                                          bool v1_stats) {
+    const char* const names[4] = {
+        v1_stats ? "total_inactive_file" : "inactive_file",
+        v1_stats ? "total_cache" : "file",
+        v1_stats ? "total_dirty" : "file_dirty",
+        v1_stats ? "total_writeback" : "file_writeback",
+    };
+    if (!stat) return {};
+    std::optional<uint64_t> found[4];
+    std::string line;
+    while (std::getline(stat, line)) {
+        std::istringstream fields(line);
+        std::string key, token, extra;
+        if (!(fields >> key)) continue;                    // blank line
+        const auto slot = [&]() -> int {
+            for (int i = 0; i < 4; ++i) if (key == names[i]) return i;
+            return -1;
+        }();
+        if (!(fields >> token) || (fields >> extra)) {     // no value, or trailing fields
+            if (slot >= 0) return {};
+            continue;
+        }
+        if (slot < 0) continue;                            // an unrelated stat key
+        if (found[slot]) return {};                        // a repeated required key
+        uint64_t value = 0;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) return {};
+        found[slot] = value;
+    }
+    if (stat.bad() || (stat.fail() && !stat.eof())) return {};   // a partial or failed read
+    for (const auto& value : found) if (!value) return {};       // a missing required key
+    const uint64_t reclaimable = std::min(*found[0], *found[1]);
+    const uint64_t unwritten = saturating_add(*found[2], *found[3]);
+    const uint64_t clean = reclaimable > unwritten ? reclaimable - unwritten : 0;
+    return std::min(usage, clean);                            // never credit more than usage
 }
 
 ConversationCgroupMemory conversation_cgroup_memory(const std::string& proc_cgroup_path,
