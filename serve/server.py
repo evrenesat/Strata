@@ -2687,7 +2687,7 @@ class StrataEngine:
             raise out_of_step(line)
 
     def close(self):
-        """End the engine process: STOP + QUIT first (the engine frees its memory itself - unpinning tens of GB can take
+        """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
         a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
         EngineStuck when it still runs after all three."""
         if getattr(self, 'priority', None):
@@ -2697,9 +2697,11 @@ class StrataEngine:
         try:
             if self.proc.poll() is None:
                 try:
-                    # STOP first: a request still running ends at its next step instead of being waited for (the
-                    # engine reads stdin on its own thread; QUIT behind a long answer would sit in its queue)
-                    self.proc.stdin.write("STOP\nQUIT\n")
+                    # QUIT only, no STOP: on a priority-capable engine a STOP abandons the in-flight generation
+                    # instead of leaving it to the cooperative park/resume path, so a restart() mid-generation
+                    # would record the request as stopped by the shutdown rather than parked (fork contract,
+                    # 1d8cb580).  QUIT still has the engine free its memory itself, which is why it goes first.
+                    self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
                     self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
