@@ -103,7 +103,11 @@ def start_of(p):
         out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    if not out or out.endswith("Z"):
+        return None
+    # identity is the PID (the argument) plus the start time; the trailing state character (R/S/...) changes
+    # between the sample and the check, so a freshly started child read as R would never match its S self
+    return "s:" + out.rsplit(None, 1)[0]
 os.set_blocking(0, True)
 data = b""
 while True:
@@ -139,7 +143,10 @@ def _start_token(pid: int) -> str:
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-    return "" if not out or out.endswith("Z") else "s:" + out
+    if not out or out.endswith("Z"):
+        return ""
+    # the same identity the watcher rebuilds: start time without the volatile state character
+    return "s:" + out.rsplit(None, 1)[0]
 
 
 def _watch(child: subprocess.Popen) -> None:
