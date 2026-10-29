@@ -264,7 +264,8 @@ void full_session(int fmt, int mode, int experts) {
         check(got_state.gdn==want_state.gdn && got_state.ple==want_state.ple && got_state.tails==want_state.tails &&
               got_state.dead==want_state.dead && got_state.block_pos==want_state.block_pos,"the same running state");
         check(untouched.live.ids==a.live.ids && equal(untouched.kv[0],a.kv[0]) && equal(untouched.kv[1],a.kv[1]),
-              "the parked image is unchanged");    }
+              "the parked image is unchanged");
+    }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty};
