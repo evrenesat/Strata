@@ -177,6 +177,10 @@ class ProtocolTests(PipeFixture):
         self.assertEqual(headers,[])
         self.assertEqual(e.priority.active,b.id)
         self.assertEqual(len(e.priority.requests),1)
+    def test_priority_command_refuses_logprobs_sampling(self):
+        e=StrataEngine('unused',[],lazy=True)
+        with self.assertRaises(ValueError):e._priority_command([1,2,3],10,{'logprobs':True,'top_logprobs':5},None)
+        self.assertNotIn('logprobs',e._priority_command([1,2,3],10,{},None))
     def test_preheader_disconnect_releases_exact_reservation(self):
         e=self.start(b'x'*100);cancel=threading.Event();cancel.set()
         with self.assertRaises(PriorityUnavailable):e.reserve_priority([1,2,3],200,{},cancel)

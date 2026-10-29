@@ -2336,6 +2336,9 @@ class StrataEngine:
                 pass
 
     def _priority_command(self, ids, max_new, sampling, embeddings):
+        if top_logprobs(sampling or {}) is not None:   # the engine's `LP` line is untagged stdout, and the priority
+            raise ValueError("logprobs are not served by the priority scheduler: the priority protocol has no LP "
+                             "branch yet")   # scheduler fails its whole engine on one untagged line
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         return f"{head} {','.join(str(int(t)) for t in ids)}"
@@ -8094,6 +8097,12 @@ def make_handler(svc: Service):
                 # only, which a client cannot tell from the model's own answer, so the longer one is refused.
                 raise ValueError('logprobs is available with "parallel" (batch slots) only for max_tokens 1; '
                                  'run the server without "--parallel" for longer replies')
+            if top_logprobs(req) is not None and getattr(svc.engine, 'priority', None):
+                # priority serving: the scheduler's reader accepts tagged lines only, and the engine's `LP` line
+                # (emit_lp_line, src/program/generate.cpp) is plain stdout - one logprobs request would fail the
+                # scheduler and with it every in-flight request.  Refused here, before anything is sent.
+                raise ValueError('logprobs is not available with priority serving (the priority protocol has no '
+                                 'LP branch yet); run the server without "--priority-serving"')
             n_vocab = len(getattr(svc.tok, "tokens", ())) or None
             if top_logprobs(req) is not None and n_vocab:
                 # emit_lp_line indexes the logits row with each named id as given, so an id past the vocabulary
