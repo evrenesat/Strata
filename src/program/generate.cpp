@@ -16962,7 +16962,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0,
                                                first_window, room, S_mtp, (int) ver.vocab(), (float) req_spec_min_p,
                                                mtp.spec_q(), drafts.data(), dprob.data(), sbuf.data(), sfx_match, err)) {
-                        std::printf("ERR %s\n", err.c_str()); return 1;
+                        protocol_printf("ERR %s\n", err.c_str()); return 1;
                     }
                     T = proposal.T; from_sfx = proposal.from_sfx;
                     if (first_window && merge_T > 0) T = merge_T;   // STRATA_ADMIT_MERGE_FIRST: the prompt's last tokens ride in this window
