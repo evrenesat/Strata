@@ -14621,8 +14621,8 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
-                resume = cached_match.tokens;
-                from_live = cached_match.live;
+                resume = parked.tokens;
+                from_live = parked.live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
