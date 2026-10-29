@@ -11,6 +11,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include "strata/core/proof_hash.hpp"
 
 namespace strata::core {
 namespace {
@@ -458,6 +459,73 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
     to.ple_prev[1] = tokens >= 1 ? ids[tokens - 1] : -1;
     return true;
 }
+namespace {
+bool proof_running(const ConversationCheckpoint* expected,const SessionState& ss,const ModelGeometry& g,
+                   core::ProofHash& hash,std::string& error) {
+    ConversationStateSizes z;
+    if(!conversation_session_sizes(g,ss,z,error)) return false;
+    std::array<uint8_t,65536> buffer;
+    auto read=[&](const void* source,const uint8_t* saved,size_t n) {
+        hash.add(n);
+        for(size_t at=0;at<n;) {
+            const size_t bytes=std::min(buffer.size(),n-at);
+            if(!copy(buffer.data(),static_cast<const uint8_t*>(source)+at,bytes,error)) return false;
+            if(saved && std::memcmp(buffer.data(),saved+at,bytes))
+                return fail(error,"restored running-state bytes differ");
+            hash.raw(buffer.data(),bytes);at+=bytes;
+        }
+        return true;
+    };
+    if(!read(ss.gdn_state,expected ? expected->gdn.data():nullptr,z.gdn) ||
+       !read(ss.ple_hist,expected ? expected->ple.data():nullptr,ss.ple_hist ? z.ple:0)) return false;
+    for(size_t j=0;j<owned_qsa(ss);++j) {
+        const auto& st=owned(ss,j);
+        if(!read(st.idx_tail,expected ? expected->tails.data()+j*z.tail:nullptr,z.tail) ||
+           !read(st.idx_dead,expected ? expected->dead.data()+j*z.dead:nullptr,z.dead) ||
+           !read(st.idx_block_pos,expected ? expected->block_pos.data()+j*z.block_pos:nullptr,z.block_pos)) return false;
+    }
+    hash.add(ss.ple_prev[0]);hash.add(ss.ple_prev[1]);hash.add(ss.ple_token);
+    if(expected) {
+        const auto& ids=expected->ids;
+        if(ss.ple_prev[0]!=(ids.size()>=2 ? ids[ids.size()-2]:-1) ||
+           ss.ple_prev[1]!=(ids.empty() ? -1:ids.back())) return fail(error,"restored PLE predecessor differs");
+    }
+    return true;
+}
+}
+bool conversation_snapshot_verify(const SavedConversation& image,const SessionState& ss,const ModelGeometry& g,
+                                  uint64_t& fingerprint,std::string& error) {
+    if(!conversation_snapshot_validate(image,ss,g,nullptr,error) || !sync(error)) return false;
+    core::ProofHash h;
+    if(!proof_running(&image.live,ss,g,h,error)) return false;
+    for(size_t j=0;j<owned_qsa(ss);++j) {
+        uint64_t kv=0;
+        if(!conversation_kv_verify(image.kv[j],owned(ss,j),g,image.live.ids.size(),true,kv,error)) return false;
+        h.add(kv);
+    }
+    fingerprint=h.value;return true;
+}
+bool conversation_live_fingerprint(const SessionState& ss,const ModelGeometry& g,int64_t upto,
+                                   uint64_t& fingerprint,std::string& error) {
+    if(!sync(error)) return false;
+    core::ProofHash h;
+    if(!proof_running(nullptr,ss,g,h,error)) return false;
+    std::array<uint8_t,65536> buffer;
+    for(size_t j=0;j<owned_qsa(ss);++j) {
+        SessionKvSource source;
+        if(!conversation_kv_source(source,owned(ss,j),g,upto,true,error)) return false;
+        h.add(source.format);h.add(source.cells);h.add(source.pooled_rows);
+        for(size_t part=0;part<source.sizes.size();++part) {
+            h.add(source.sizes[part]);
+            for(uint64_t at=0;at<source.sizes[part];) {
+                const size_t bytes=size_t(std::min<uint64_t>(buffer.size(),source.sizes[part]-at));
+                if(!source.read(part,at,buffer.data(),bytes)) { error=source.error();return false; }
+                h.raw(buffer.data(),bytes);at+=bytes;
+            }
+        }
+    }
+    fingerprint=h.value;return true;
+}
 
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
                                  const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error) {
@@ -619,9 +687,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     return true;
 }
 
-bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
-                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
+namespace {
+// The capture every streamed source list shares: metadata for everything but the K/V, then one source per owned QSA
+// layer and, when this session owns a draft layer, its separate source.
+bool snapshot_sources_common(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                             const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                             const QsaState* draft, std::string& error) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -633,13 +704,26 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     conversation_checkpoint_join(captured.live.gdn.data());
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
-    std::vector<SessionKvSource> out(layers + 1);
+    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
-    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
     meta = std::move(captured);
     sources = std::move(out);
     return true;
+}
+}  // namespace
+
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState& draft, std::string& error) {
+    return snapshot_sources_common(meta, sources, view, ss, g, &draft, error);
+}
+
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState* draft, std::string& error) {
+    return snapshot_sources_common(meta, sources, view, ss, g, draft, error);
 }
 
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
@@ -692,6 +776,37 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 }
 
 bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
+
+namespace {
+// The metadata checks a restore makes before any destination write, with the K/V layer count left to the caller: a
+// RAM image carries one resident entry per layer, a disk image carries none (its K/V is in the capsule file).
+bool snapshot_metadata_valid(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                             std::string& error) {
+    if (!image.live.stage_parts.empty())
+        return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
+    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    // an image holds exactly one carve's running state and K/V: same layer range or nothing
+    if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
+    return view_validate(view, ss, g, error) && conversation_checkpoint_validate(image.live, ss, g, error);
+}
+}  // namespace
+
+bool conversation_snapshot_validate_resident(const SavedConversation& image, const SessionState& ss,
+                                             const ModelGeometry& g, std::string& error) {
+    // A disk capsule holds no K/V payload: this proves the resident manifest only.  The caller proves the capsule's
+    // layers against the session's targets (conversation_kv_restore_source), before the first write, as always.
+    if (!snapshot_metadata_valid(image, ss, g, error)) return false;
+    if (!image.kv.empty()) return fail(error, "a disk capsule image must not carry resident K/V");
+    return true;
+}
+
+bool conversation_snapshot_restore_resident(const SavedConversation& image, SessionState& ss,
+                                            const ModelGeometry& g, std::string& error) {
+    // Exactly what the RAM restore does after its K/V calls: the running state and the checkpoints.
+    return conversation_checkpoint_restore(image.live, ss, g, error);
+}
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {

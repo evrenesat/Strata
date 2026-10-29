@@ -211,6 +211,16 @@ void full_session(int fmt, int mode, int experts) {
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
     {
+        SavedConversation main_only;
+        check(conversation_snapshot_save(main_only,view,ss,g,nullptr,err),"capture proof fixture without draft");
+        uint64_t fingerprint=0;
+        check(conversation_snapshot_verify(main_only,ss,g,fingerprint,err),"bounded whole main readback including running state");
+        cuda_check(cudaMemset(ss.gdn_state,31,main_only.live.gdn.size()));
+        check(!conversation_snapshot_verify(main_only,ss,g,fingerprint,err),"readback detects changed recurrent state");
+        check(conversation_snapshot_restore(main_only,ss,g,nullptr,err)==ConversationRestore::restored,"repair exact proof fixture");
+        check(conversation_snapshot_verify(main_only,ss,g,fingerprint,err),"readback after repaired restore");
+    }
+    {
         // #2409: a restore writes into the session's own buffers. After the copy stream exists (the restores above made
         // it) a restore of either image allocates nothing on the card: free memory does not move (2 MiB allocation
         // granules; 4 MiB of slack for a desktop card's other programs).
@@ -254,8 +264,7 @@ void full_session(int fmt, int mode, int experts) {
         check(got_state.gdn==want_state.gdn && got_state.ple==want_state.ple && got_state.tails==want_state.tails &&
               got_state.dead==want_state.dead && got_state.block_pos==want_state.block_pos,"the same running state");
         check(untouched.live.ids==a.live.ids && equal(untouched.kv[0],a.kv[0]) && equal(untouched.kv[1],a.kv[1]),
-              "the parked image is unchanged");
-    }
+              "the parked image is unchanged");    }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty};

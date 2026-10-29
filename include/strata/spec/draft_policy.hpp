@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "strata/core/proof_hash.hpp"
 
 namespace strata::spec {
 
@@ -93,6 +94,14 @@ public:
     /// After a round of the MTP window T whose drafts were p[0..T-1): `accepted` of them held.  Teaches draft_rate().
     void observe_probs(const float* p, int n_window_drafts, int accepted);
     double draft_rate(double p) const;     // acceptance of an MTP draft that came with probability p
+    void proof_hash(core::ProofHash& h) const {
+        h.add(max_t_); h.add(margin_); h.add(cost_); h.add(cost_n_); h.add(mtp_tok_); h.add(mtp_n_);
+        h.add(ok_); h.add(bad_); h.add(cok_); h.add(cbad_); h.add(rounds_); h.add(last_);
+        h.add(bk_); h.add(robust_); h.add(pa_ok_); h.add(pa_n_);
+        h.add(tried_); h.add(delayed_n_);   // gated-proposal bookkeeping (observe_committed/defer_cost/apply_costs)
+        h.add(held_.size());
+        for (const auto& hc : held_) { h.add(hc.end); h.add(hc.bucket); h.add(hc.t); h.add(hc.ms); }
+    }
 
 private:
     static int bucket(int match);

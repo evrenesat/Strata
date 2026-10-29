@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "strata/core/proof_hash.hpp"
 
 namespace strata::spec {
 
@@ -39,6 +40,13 @@ public:
     int last_match() const { return last_match_; }
     size_t size() const { return hist_.size(); }
     const std::vector<int32_t>& history() const { return hist_; }
+    bool allocated() const { return !table_.empty(); }
+    size_t owned_bytes() const { return hist_.capacity()*sizeof(int32_t) + table_.capacity()*sizeof(Slot); }
+    void proof_hash(core::ProofHash& h) const {
+        h.add(min_match_); h.add(max_match_); h.add(hist_); h.add(mask_); h.add(last_match_);
+        h.add(table_.size());
+        for(const auto& s:table_) { h.add(s.key); for(auto p:s.pos) h.add(p); h.add(s.n); }
+    }
 
 private:
     struct Slot {
