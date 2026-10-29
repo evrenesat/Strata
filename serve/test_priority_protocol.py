@@ -1,5 +1,6 @@
 """Real StrataEngine pipe reader against a bounded synthetic engine, no GPU."""
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import urllib.request
 import threading
 import time
 import unittest
+from unittest import mock
 from serve.priority_scheduler import (Role, PriorityScheduler, PriorityUnavailable, PriorityProtocolError,
                                       PriorityQueueFull, PrioritySpillLost)
 from serve.test_priority_scheduler import Clock
@@ -148,6 +150,11 @@ class ProtocolTests(PipeFixture):
         with self.assertRaises(ValueError):engine_args({'args':[],'priority':{'idle_backfill':True}})
         self.assertEqual(engine_args({'args':[]}),[])
         self.assertIn('--priority-serving',engine_args({'args':[],'priority':{'enabled':True}}))
+    def test_merge_first_env_refused_under_priority(self):
+        with mock.patch.dict(os.environ,{'STRATA_ADMIT_MERGE_FIRST':'1'}):
+            with self.assertRaises(ValueError):engine_args({'args':[],'priority':{'enabled':True}})
+        with mock.patch.dict(os.environ,{'STRATA_ADMIT_MERGE_FIRST':'0'}):
+            self.assertIn('--priority-serving',engine_args({'args':[],'priority':{'enabled':True}}))
     def test_priority_control_commands_cannot_interleave(self):
         e=self.start()
         with self.assertRaises(ValueError):e.session_file('save','/unused')

@@ -3566,6 +3566,12 @@ def engine_args(cfg: dict) -> list[str]:
     if priority.get('enabled') or '--priority-serving' in args:
         if any(k in args for k in ('--batch', '--slots', '--layer-split', '--pipeline-windows', '--lookup-chain')):
             raise ValueError('priority requires a serial single-GPU engine')
+        # the engine's exact rule (generate.cpp admit_merge_first_env): set and not starting with "0" enables it
+        merge_first = os.environ.get('STRATA_ADMIT_MERGE_FIRST')
+        if merge_first is not None and (merge_first == '' or merge_first[0] != '0'):
+            # its merge-first batch admission writes an untagged "PP" progress line (generate.cpp), which the
+            # priority scheduler treats as fatal untagged output
+            raise ValueError('priority requires STRATA_ADMIT_MERGE_FIRST off (unset it, or start the value with "0")')
         if '--priority-serving' not in args:
             args.append('--priority-serving')
     spill = priority_spill_settings(cfg)
