@@ -7,15 +7,23 @@
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 
 namespace strata::core {
 
 NativeHead::~NativeHead() {
+    unload();
+}
+
+void NativeHead::unload() {
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
+    if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
+    scratch_ = nullptr;
+    weights_ = nullptr;
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
@@ -28,7 +36,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         // The architecture is the metadata shard's; output.weight comes from whichever shard holds it (shard 2
         // of Unsloth's UD-Q4_K_XL, whose shard 1 holds no tensor).  GgufModel refuses a duplicate across shards.
         const strata::GgufModel model(shards);
-        err = strata::check_architecture(model.meta());
+        err = strata::check_engine_architecture(model.meta());
         if (!err.empty()) return false;
         size_t at = 0;
         const strata::TensorInfo* tensor = model.find("output.weight", &at);
@@ -59,6 +67,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             return false;
         }
         weights_ = weights;
+        { int d = -1; if (cudaGetDevice(&d) == cudaSuccess) device_ = d; }
         scratch_ = scratch;
         bytes_ = bytes;
         n_in_ = (int) n_in;
@@ -66,6 +75,8 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         type_ = (int) tensor->type;
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
+        if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
+            strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -115,7 +126,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         const strata::GgufModel model(shards);
         // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
         const strata::MetaValue* arch = model.meta().get("general.architecture");
-        err = arch != nullptr && arch->s == "strata-embd" ? std::string() : strata::check_architecture(model.meta());
+        err = arch != nullptr && arch->s == "strata-embd" ? std::string() : strata::check_engine_architecture(model.meta());
         if (!err.empty()) { err = "native embedding: " + err; return false; }
         size_t at = 0;
         const strata::TensorInfo* t = model.find("token_embd.weight", &at);
@@ -136,6 +147,34 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             return false;
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
+        // STRATA_EMBED_VRAM=1: the table in the current device's VRAM instead of mapped host memory. The same
+        // bytes, read by the same gather kernels through dev_ (bitwise the same rows); what changes is where a
+        // prompt's scattered row reads go: over a PCIe Gen2 x4 link they cost more than the table's size in VRAM
+        // is worth. Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped
+        // placement below is used as before (and the fallback is said).
+        if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
+            size_t free_b = 0, total_b = 0;
+            const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+            void* d = nullptr;
+            if (have_free && (uint64_t) free_b > bytes_ + ((uint64_t) 512 << 20) &&
+                cudaMalloc(&d, bytes_) == cudaSuccess) {
+                if (cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) == cudaSuccess) {
+                    std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
+                                         "(%llu MiB were free)\n",
+                                 (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
+                    dev_ = d;   // host_ stays null: the destructor frees dev_
+                    type_ = (int) t->type;
+                    n_embd_ = n_embd;
+                    n_vocab_ = n_vocab;
+                    return true;
+                }
+                (void) cudaFree(d);
+            }
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 not taken (%llu MiB free, the table "
+                                 "needs %llu MiB plus 512 MiB): kept in mapped host memory\n",
+                         (unsigned long long) (have_free ? free_b >> 20 : 0), (unsigned long long) (bytes_ >> 20));
+        }
         cudaError_t host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
         if (host_err != cudaSuccess) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
