@@ -13406,7 +13406,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
         };
         // One protected unfinished request and one optional completed foreground
         // prefix. The second serve-loop frame executes foreground calls serially.
-        strata::program::GenerationCapsule parked;
+        strata::program::GenerationCapsule capsule;
         uint64_t parked_id=0;
         bool parked_cancelled=false;
         struct HotForeground {
@@ -13430,7 +13430,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
             using PC=strata::program::ProofCommand;
             if(!o.priority_proof) return false;
             if(command.kind==PC::reset) {
-                if(!idle || parked.occupied || parked_id) return false;
+                if(!idle || capsule.occupied || parked_id) return false;
                 live.clear();live_imgs.clear();live_ok=false;checks.clear();tail_ckpt_len=-1;check_clock=0;
                 conversations=strata::core::ConversationCache(
                     o.prompt_cache>0 ? (size_t)o.conversation_cache_mib*1024*1024:0,(size_t)o.conversation_cache_slots);
@@ -13463,8 +13463,8 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
         auto cancel_parked=[&]() {
             if (!parked_id || parked_cancelled) return;
             ProtocolOwner owner(parked_id);
-            const auto& d=parked.driver;
-            const bool decoding=parked.saved_phase==strata::program::GenerationPhase::decode;
+            const auto& d=capsule.driver;
+            const bool decoding=capsule.saved_phase==strata::program::GenerationPhase::decode;
             const double prompt_ms=std::chrono::duration<double,std::milli>(
                 (decoding ? d.decode_began : d.parked_at)-d.began).count()-d.paused_prefill_ms;
             const double decode_ms=decoding ? std::chrono::duration<double,std::milli>(
@@ -13474,7 +13474,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                 std::max(0.0,prompt_ms),std::max(0.0,decode_ms),
                 (long long)d.draft_accepted,(long long)d.draft_offered,(long long)d.reused);
             std::fflush(stdout);
-            parked=strata::program::GenerationCapsule{};
+            capsule=strata::program::GenerationCapsule{};
             hot.reset(); parked_cancelled=true;
         };
         std::function<int(uint64_t)> serve_loop;
@@ -15774,7 +15774,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     if(pause) { native_proof.pause_id=0;native_proof.pause_pending=false; }
                 }
                 if (stop_req.load() || !pause) return 0;
-                if (suspended || parked.occupied) {
+                if (suspended || capsule.occupied) {
                     std::fprintf(stdout,"PREFUSED %llu nested_pause\n",(unsigned long long)request_id);
                     std::fflush(stdout); return 0;
                 }
@@ -15815,7 +15815,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     std::fprintf(stdout,"R %llu BLOCK state_transfer 180\n",(unsigned long long)request_id);
                     std::fflush(stdout);
                 };
-                auto result=strata::program::generation_capture(parked,request,checks,*runtime,err);
+                auto result=strata::program::generation_capture(capsule,request,checks,*runtime,err);
                 if (result==strata::program::GenerationTransfer::transfer_failed) return transfer_fatal();
                 if (result!=strata::program::GenerationTransfer::complete) {
                     std::fprintf(stdout,"PREFUSED %llu pause_unavailable\n",(unsigned long long)request_id);
@@ -15839,9 +15839,9 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     } catch (const std::bad_alloc&) { return transfer_fatal(); }
                 }
                 std::fprintf(stdout,"PAUSED %llu %s %lld %lld%s\n",(unsigned long long)request_id,
-                    parked.saved_phase==strata::program::GenerationPhase::prefill ? "prefill" : "decode",
-                    (long long)parked.driver.position,(long long)parked.driver.produced,
-                    parked.spill ? " spill=1" : "");
+                    capsule.saved_phase==strata::program::GenerationPhase::prefill ? "prefill" : "decode",
+                    (long long)capsule.driver.position,(long long)capsule.driver.produced,
+                    capsule.spill ? " spill=1" : "");
                 std::fflush(stdout);
                 for (;;) {
                     strata::core::progress().busy.store(false);
@@ -15897,7 +15897,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                     } else checks.clear();
                     auto resume_runtime=request_runtime(err);
                     if (!resume_runtime) return transfer_fatal();
-                    const auto restored=strata::program::generation_restore(parked,request,checks,*resume_runtime,err);
+                    const auto restored=strata::program::generation_restore(capsule,request,checks,*resume_runtime,err);
                     if (restored==strata::program::GenerationTransfer::transfer_failed) return transfer_fatal();
                     if (restored==strata::program::GenerationTransfer::lost) {
                         // The capsule's payload proved unusable before any live write: the engine is intact, so this
@@ -15907,7 +15907,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                         // Nothing is parked any more: release the capsule's driver, checkpoints and (already closed)
                         // capsule file.  Without this the capsule stays occupied, every later VIP preemption is
                         // refused with `nested_pause`, and possibly hundreds of megabytes stay resident.
-                        parked=strata::program::GenerationCapsule{};
+                        capsule=strata::program::GenerationCapsule{};
                         std::fprintf(stdout,"R %llu ERR priority_spill_lost\n",(unsigned long long)request_id);
                         std::fflush(stdout);
                         return 3;
