@@ -14,7 +14,8 @@ from serve.priority_scheduler import (Role, PriorityScheduler, PriorityUnavailab
                                       PriorityQueueFull, PrioritySpillLost)
 from serve.test_priority_scheduler import Clock
 from serve.server import (StrataEngine, engine_args, priority_queue_limits, sse_keepalive, Service, ByteTokenizer,
-                          EngineDied, Role, serve, priority_spill_settings, prepare_spill_directory)
+                          EngineDied, Role, serve, priority_spill_settings, prepare_spill_directory,
+                          require_serial_priority_engine)
 from serve.frontend import ChatTemplate
 
 FAKE_PRIORITY = r'''
@@ -155,6 +156,16 @@ class ProtocolTests(PipeFixture):
             with self.assertRaises(ValueError):engine_args({'args':[],'priority':{'enabled':True}})
         with mock.patch.dict(os.environ,{'STRATA_ADMIT_MERGE_FIRST':'0'}):
             self.assertIn('--priority-serving',engine_args({'args':[],'priority':{'enabled':True}}))
+    def test_prefill_only_refused_under_priority(self):
+        e=self.start()
+        with self.assertRaises(ValueError):list(e.generate([1,2,3],0,{},threading.Event(),None,True))
+        self.assertEqual(self.events.read_text(),'')       # nothing reached the engine
+    def test_replicas_and_split_refused_under_priority(self):
+        with self.assertRaises(SystemExit):require_serial_priority_engine({'args':[],'priority':{'enabled':True}},
+                                                                          [[0],[1]],None)
+        with self.assertRaises(SystemExit):require_serial_priority_engine({'args':[],'priority':{'enabled':True}},
+                                                                          [],{'prefill_gpu':0,'decode_gpu':1})
+        self.assertIsNone(require_serial_priority_engine({'args':[],'priority':{'enabled':True}},[],None))
     def test_priority_control_commands_cannot_interleave(self):
         e=self.start()
         with self.assertRaises(ValueError):e.session_file('save','/unused')

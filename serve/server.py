@@ -3588,6 +3588,15 @@ def engine_args(cfg: dict) -> list[str]:
     return learned_profile_args(cfg, args)
 
 
+def require_serial_priority_engine(cfg: dict, groups: list, split) -> None:
+    """Priority serving runs one serial single-GPU engine: refused at startup across data-parallel replicas
+    or split serving (spill requires priority, so this covers both; a split pair is two serial engines, not
+    one priority scheduler).  Merge-added guard: replicas from the 20261027 sync, split added 20261029."""
+    if '--priority-serving' in engine_args(cfg) and (groups or split):
+        raise SystemExit("[strata] config: priority serving requires a serial single-GPU engine and cannot "
+                         "run across data-parallel replicas or split serving")
+
+
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
@@ -9505,11 +9514,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 split_mod.check_cfg(cfg, split)
         except split_mod.SplitConfigError as e:
             raise SystemExit(f"[strata] config {e}")
-        if '--priority-serving' in engine_args(cfg) and (groups or split):
-            # spill requires priority, so this covers both; a split pair is two serial engines, not one
-            # priority scheduler (merge-added guard: replicas from the 20261027 sync, split added 20261029)
-            raise SystemExit("[strata] config: priority serving requires a serial single-GPU engine and cannot "
-                             "run across data-parallel replicas or split serving")
+        require_serial_priority_engine(cfg, groups, split)
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
         elif split:
