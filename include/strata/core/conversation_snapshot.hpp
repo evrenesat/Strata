@@ -52,7 +52,7 @@ bool conversation_kv_source(SessionKvSource& source, const QsaState& state, cons
                             int64_t upto, bool include_index, std::string& error);
 // How a restore ended: `invalid` is a refusal before any write, `transfer_failed` may already have written part
 // of the destination, and the caller must not continue inference from such a session.
-// (enum class ConversationRestore is declared with the #2409 copy-stream helper, beside the restore calls.)
+enum class ConversationRestore { restored, invalid, transfer_failed };
 
 // --- the disk path's halves: visit a payload as verified blocks, write one into the live pools ----
 // Pushes a RAM image's own segmented buffers as complete blocks, in part order, with no staging copy.  A verified
@@ -215,7 +215,7 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 /// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
 bool conversation_copy_stream_ready(int device);
-enum class ConversationRestore { restored, invalid, transfer_failed };
+// (enum class ConversationRestore is declared above, before its first use in ConversationKvRestoreResult.)
 // The disk capsule's two halves.  Validation: the same metadata checks, with the image required to carry NO resident
 // K/V (it lives in the capsule file, and the caller proves those layers against the session's targets before any
 // write).  Restore: the running state and checkpoints, with no K/V call at all - the caller restores the K/V from
