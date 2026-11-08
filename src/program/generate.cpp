@@ -13559,7 +13559,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
             if (!adapt_tick(true)) {
-                std::printf("ERR an adaptive refill failed\n");
+                protocol_printf("ERR an adaptive refill failed\n");
                 return 1;
             }
             admit_slot = -1;
@@ -14153,7 +14153,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                 native_head.unload();
                 sp.reset();
                 if (init_prompt_paths() != 0) {
-                    std::printf("ERR rebuilding the head-alias prompt path failed: %s\n", err.c_str());
+                    protocol_printf("ERR rebuilding the head-alias prompt path failed: %s\n", err.c_str());
                     return 1;
                 }
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: prompt workspace rebuilt in %.1f ms\n",
@@ -14555,7 +14555,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                                                                        use_mtp ? &mtp.kv_state() : nullptr, err) !=
                         strata::core::ConversationRestore::restored) {
                     // validated above and guarded while parking: a failure here is fatal, as for a whole restore
-                    std::printf("ERR restoring a borrowed conversation prefix: %s\n",
+                    protocol_printf("ERR restoring a borrowed conversation prefix: %s\n",
                                 err.empty() ? "gone" : err.c_str());
                     return 1;
                 }
@@ -15952,7 +15952,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err))) {
-                std::printf("ERR %s\n", err.c_str());
+                protocol_printf("ERR %s\n", err.c_str());
                 return 1;
             }
             ver.set_sampling(req_sp);
@@ -16192,13 +16192,13 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                 sp.reset();
                 const auto head_t0 = Clock::now();
                 if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
-                    std::printf("ERR restoring the native output head failed: %s\n", err.c_str());
+                    protocol_printf("ERR restoring the native output head failed: %s\n", err.c_str());
                     return 1;
                 }
                 // the verify windows' captured graphs read the head at the address of their capture
                 if (prefill_head_alias_at == nullptr) prefill_head_alias_at = native_head.weights();
                 if (native_head.weights() != prefill_head_alias_at) {
-                    std::printf("ERR --prefill-head-alias: the output head was reloaded at another address, so the "
+                    protocol_printf("ERR --prefill-head-alias: the output head was reloaded at another address, so the "
                                 "captured verify graphs would read freed memory\n");
                     return 1;
                 }
@@ -17239,7 +17239,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
-                        std::printf("ERR an adaptive refill failed\n");
+                        protocol_printf("ERR an adaptive refill failed\n");
                         return 1;
                     }
                     finish = "nonfinite";
@@ -17248,7 +17248,7 @@ if (o.priority_serving && (!o.serve || o.batch || !o.layer_split.empty() || o.pi
                 // a merged window: the drafter's rows of the prompt tokens in it, as the prompt windows give them
                 if (merged && use_mtp && !mtp.prefill(ver.final_R_all(), window.data() + 1, T - 1, p, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
-                    std::printf("ERR %s\n", err.c_str());
+                    protocol_printf("ERR %s\n", err.c_str());
                     return 1;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
