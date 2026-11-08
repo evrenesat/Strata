@@ -34,88 +34,6 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     return {host ? st.host.k_pool : st.k_pool, host ? st.host.v_pool : st.v_pool, nullptr, nullptr, st.idx_pooled};
 }
 
-// (Upstream's own helpers for the RAM path in this file; the disk capsule and its tests use the shared
-// conversation_kv_layout/conversation_kv_layout_targets verdicts, which encode the same arithmetic.)
-bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
-    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
-    if (upto < 0 || upto > st.max_cells || upto > std::numeric_limits<int64_t>::max() - (page - 1)) {
-        error = "conversation snapshot: invalid K/V extent";
-        return false;
-    }
-    return true;
-}
-
-bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error) {
-    if (!valid_extent(st, upto, error)) return false;
-    if (st.kv_hybrid && (st.kv_mode == 2 || st.kv_q4 || st.kv_int8)) {   // a streamed one reads its host copy
-        error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
-        return false;
-    }
-    const auto s = strata::kernels::qsa_real_shapes();
-    const bool int8_keys = st.kv_int8 || st.kv_hybrid;
-    if (g.n_head_kv <= 0 || g.head_dim <= 0 || g.head_dim > INT32_MAX || g.idx_key_dim <= 0 ||
-        (st.kv_q4 && g.head_dim % 32) || (int8_keys && !st.kv_q4 && g.head_dim % 64)) {
-        error = "conversation snapshot: invalid K/V geometry";
-        return false;
-    }
-    const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
-    const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
-                              : (size_t) g.head_dim * (int8_keys ? 1 : 2);
-    // Include the moving spare row, not only completed blocks. The checkpoint
-    // restore reconstructs that row when rewinding to an earlier prefix.
-    const int64_t pooled = index && upto > 0 ? upto / s.idx_block + 1 : 0;
-    // Format 3 identifies snapshot K8V4 only; never pass it to the block movers.  Rotated INT8 K/V (#293,
-    // STRATA_KV_ROT=1) is another format too (+16): its bytes mean nothing to a state that does not rotate, so a
-    // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
-    // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
-    const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
-    using conversation_detail::product;
-    if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
-        !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
-                           int8_keys && !st.kv_q4 ? (uint64_t) (g.head_dim / 64) * 2 : 0}) ||
-        !product(l.pooled, {(uint64_t) pooled, (uint64_t) g.idx_key_dim, sizeof(float)})) {
-        error = "conversation snapshot: K/V byte count overflow";
-        return false;
-    }
-    l.value_data = l.data;
-    l.value_scales = l.scales;
-    if (st.kv_hybrid) {
-        if (!product(l.value_data, {(uint64_t) cells, (uint64_t) g.n_head_kv,
-                                   (uint64_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)})) {
-            error = "conversation snapshot: hybrid V byte count overflow";
-            return false;
-        }
-        l.value_scales = 0;
-    }
-    return true;
-}
-
-bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error) {
-    if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
-        st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
-        (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
-        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
-        error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
-        return false;
-    }
-    if (st.kv_mode == 1) {
-        const auto& m = st.map;
-        if (m.n_blocks != st.n_pages || m.n_slots != st.n_slots || !m.page_table || !m.slot_block ||
-            !m.slot_stamp || !m.slot_ref || !m.ctl || !m.miss_block || !m.miss_slot) {
-            error = "conversation snapshot: invalid streaming map";
-            return false;
-        }
-    }
-    if (st.kv_mode == 2 && (!st.page_table ||
-        (st.kv_q4 ? !st.k_q4 || !st.v_q4 : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
-                                                    : !st.k_pool || !st.v_pool))) {
-        error = "conversation snapshot: invalid draft ring";
-        return false;
-    }
-    return true;
-}
-
 // STRATA_PARK_VRAM_MIB=N (with STRATA_PARK_ASYNC): a park also keeps the whole K/V of its image in VRAM, in a slot
 // of its own, while the slots' total stays within N MiB; a restore of that image copies from the slot device to
 // device (~1 ms) instead of from the host buffers over PCIe, and needs no wait for the background copy.  A slot is
@@ -431,8 +349,10 @@ bool conversation_kv_finish_restore(const QsaState& st, const ModelGeometry& g, 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error, bool queued) {
     Layout lf{}, lt{};
-    if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
-        !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
+    if (!conversation_kv_layout(from, g, upto, index, lf, error) ||
+        !conversation_kv_layout_targets(lf, from, upto, error) ||
+        !conversation_kv_layout(to, g, upto, index, lt, error) ||
+        !conversation_kv_layout_targets(lt, to, upto, error)) return false;
     if (lf.format != lt.format || lf.cells != lt.cells || lf.page_size != lt.page_size ||
         lf.pooled_rows != lt.pooled_rows || lf.data != lt.data || lf.value_data != lt.value_data ||
         lf.scales != lt.scales || lf.value_scales != lt.value_scales || lf.pooled != lt.pooled) {
@@ -492,7 +412,8 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     }
     if (!conversation_kv_validate(image, st, g, captured, index, error)) return false;
     Layout l{};   // the prefix's extent; validation above checked the image against the captured one
-    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    if (!conversation_kv_layout(st, g, upto, index, l, error) ||
+        !conversation_kv_layout_targets(l, st, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     for (size_t i = 0; i < src.size(); ++i)
