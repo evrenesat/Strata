@@ -156,17 +156,35 @@ GenerationLookupLease::~GenerationLookupLease() {
     rounds_=driver_.rounds;
 }
 
+size_t CapsuleSpill::bytes() const {
+    // The retained part is RAM: the manifest itself plus one digest per stored block and the per-layer geometry.
+    size_t n=sizeof(*this)+sizeof(manifest);
+    for (const auto& layer:manifest.main)
+        for (const auto& extent:layer.extents) count(n,extent.blocks);
+    if (manifest.draft)
+        for (const auto& extent:manifest.draft->extents) count(n,extent.blocks);
+    return n;
+}
+
 GenerationCapsule::GenerationCapsule(GenerationCapsule&& other) noexcept { *this=std::move(other); }
 GenerationCapsule& GenerationCapsule::operator=(GenerationCapsule&& other) noexcept {
     if (this==&other) return *this;
     version=other.version; saved_phase=other.saved_phase;
     driver=std::move(other.driver); main=std::move(other.main); mtp=std::move(other.mtp);
+    spill=std::move(other.spill);   // its assignment closes any descriptor this capsule held
+    other.spill.reset();            // a moved-from capsule owns nothing, so it reports no bytes
     admitted_bytes=std::exchange(other.admitted_bytes,0); occupied=std::exchange(other.occupied,false);
     return *this;
+}
+std::optional<CapsuleSpill> GenerationCapsule::release_spill() {
+    std::optional<CapsuleSpill> out=std::move(spill);
+    spill.reset();
+    return out;
 }
 size_t GenerationCapsule::bytes() const {
     size_t n=sizeof(*this); add(n,driver.bytes()); add(n,main.bytes());
     if (mtp) add(n,mtp->bytes());
+    if (spill) add(n,spill->bytes());   // the manifest only: a spilled payload is not resident
     return n;
 }
 bool generation_memory_admit(std::optional<uint64_t> available,uint64_t allocation,
@@ -181,13 +199,22 @@ bool generation_memory_postcheck(std::optional<uint64_t> available,uint64_t reta
 bool generation_publish(GenerationCapsule& out,GenerationDriver& driver,
         std::vector<core::ConversationCheckpoint>& checks,core::SavedConversation&& main,
         std::optional<core::MtpRequestState>&& mtp,size_t bytes,std::optional<uint64_t> available,
-        std::string& error) {
+        std::string& error,std::optional<CapsuleSpill>&& spill) {
     if (out.occupied || !driver.validate(error) || main.live.ids!=driver.consumed ||
         !main.checkpoints.empty() || mtp.has_value()!=driver.uses_mtp ||
         !generation_memory_postcheck(available,bytes,error)) return false;
+    // A disk capture is part of the same transaction: prove it here, while nothing has moved yet, so a broken file
+    // refuses the publish instead of leaving a half-published capsule.
+    if (spill) {
+        if (!spill->valid()) return fail(error,"generation capsule spill has no open file");
+        if (!core::spill_manifest_check(spill->manifest,error)) return false;
+        if (spill->manifest.payload_bytes==0) return fail(error,"generation capsule spill is empty");
+        if (!main.kv.empty()) return fail(error,"generation capsule spill and resident K/V cannot both be set");
+    }
     out.saved_phase=driver.phase;
     main.checkpoints=std::move(checks);
     out.main=std::move(main); out.mtp=std::move(mtp); out.driver=std::move(driver);
+    out.spill=std::move(spill);   // moved only after every check, and before the capsule counts as occupied
     out.admitted_bytes=bytes; out.occupied=true; driver.phase=GenerationPhase::parked;
     return true;
 }

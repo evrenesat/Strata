@@ -1,10 +1,13 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_kv_layout.hpp"
+#include "strata/core/kv_transfer.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <functional>
 #include <string>
 
 namespace strata::core {
@@ -25,6 +28,18 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& state
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+// conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
+// The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
+// `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
+// and the caller synchronizes the device before it reads or writes either state.
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                          int64_t upto, bool include_index, std::string& error, bool queued = false);
+// The first `upto` tokens of an image captured at `captured` tokens: the leading bytes of each buffer (cells come
+// first in the identity layout, as conversation_kv_save takes them), the image untouched.  Cells and indexer rows
+// past `upto` in the restored pages hold the image's later tokens until a request writes them, as after a whole
+// restore followed by a rewind to a checkpoint.
+bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                                    int64_t captured, int64_t upto, bool include_index, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -35,6 +50,60 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, std::string& error);
+// How a restore ended: `invalid` is a refusal before any write, `transfer_failed` may already have written part
+// of the destination, and the caller must not continue inference from such a session.
+enum class ConversationRestore { restored, invalid, transfer_failed };
+
+// --- the disk path's halves: visit a payload as verified blocks, write one into the live pools ----
+// Pushes a RAM image's own segmented buffers as complete blocks, in part order, with no staging copy.  A verified
+// spill read pushes its blocks through the same sink instead.
+bool conversation_kv_visit(const ConversationKv& image, const KvBlockSink& sink, std::string& error);
+// The live destination for a restore: one verified block is copied into the authoritative pool for its part, bounds
+// checked against the layout.  The caller synchronizes the device before and after, exactly as the RAM restore
+// requires.  An empty function (with `error` set) means the state cannot be a destination.
+KvBlockSink conversation_kv_writer(const QsaState& state, const ConversationKvLayout& layout, std::string& error);
+// After every part was written: invalidate the streaming map and refill the resident ring from the restored
+// authoritative pools, exactly as the RAM restore does.
+bool conversation_kv_finish_restore(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
+
+// What a transfer restore ended as, in both vocabularies: the RAM-shaped outcome for existing callers and the
+// transaction detail (refused / lost / fatal) that decides between a typed loss and a poisoned engine.
+struct ConversationKvRestoreResult {
+    ConversationRestore outcome = ConversationRestore::invalid;
+    KvTransferOutcome detail = KvTransferOutcome::refused;
+    uint64_t verified_bytes = 0;
+    std::string error;
+};
+// Restore any K/V source through the shared transaction rules: verify, then write, then count, under one mutation
+// boundary, followed by the residency finish.  `invalid` means nothing was written.
+ConversationKvRestoreResult conversation_kv_restore_source(const QsaState& state, const ModelGeometry& g, int64_t upto,
+                                                           bool include_index, const KvDriveFn& drive);
+
+// One layer's destination for a multi-layer restore.  Main layers come first in the vector, the draft entry (if any)
+// last, which is the order a capsule's manifest uses.
+struct ConversationKvTarget {
+    const QsaState* state = nullptr;
+    bool draft = false;
+    int64_t upto = 0;   // this layer's extent: the main prefix for a QSA layer, the speculative extent for the draft
+};
+// Restore every layer of a capsule from ONE verified pass under ONE mutation boundary: all layouts are validated and
+// every destination prepared before the first write, each block goes to its own layer, and the residency finish runs
+// for every layer after the last write.  `invalid` means nothing was written.
+// `before_draft`, when set, runs exactly once immediately before the draft entry's first block is written - after
+// every main block has been.  That is where a capsule restores the main layers' RECURRENT state, so the order stays
+// K/V, then recurrent state, then the draft's own K/V.  It is not called when the capsule has no draft entry.
+ConversationKvRestoreResult conversation_kv_restore_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive,
+                                                           const std::function<bool(std::string&)>& before_draft = {});
+
+// Proof readback for a capsule: the same one-pass walk, but each block is COMPARED with the live pools instead of
+// written to them, and hashed into `fingerprint`.  This is what proves a streamed restore put the bytes in the right
+// device pages - the block digests only prove the file matched its manifest.  No host copy of the K/V is made.
+ConversationKvRestoreResult conversation_kv_compare_layers(const ModelGeometry& g,
+                                                           const std::vector<ConversationKvTarget>& targets,
+                                                           const KvLayerDriveFn& drive, uint64_t& fingerprint);
+
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -59,8 +128,48 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+/// STRATA_CKPT_ASYNC=1 (CUDA, opt-in): conversation_checkpoint_save copies the GDN state into a device staging buffer
+/// and moves it into the checkpoint's host vector on a background thread (the PCIe copy overlaps what follows: the
+/// rest of the prompt, the reply).  This waits for that copy; every reader of a checkpoint's bytes calls it first
+/// (restore, snapshot save / restore, the parked copies, the session file, the serve loop at each request).  No-op
+/// when nothing is in flight.
+/// `only` (non-null): wait only when the copy in flight is into that checkpoint's GDN bytes.
+void conversation_checkpoint_join(const void* only = nullptr);
+/// STRATA_PARK_ASYNC: waits until the last parked image's K/V has landed in its host buffers (no-op otherwise); the
+/// readers of a parked image's K/V call it first, and the image itself before it frees them (SavedConversation::pending).
+void conversation_park_join();
+/// STRATA_PARK_ASYNC=1 (CUDA, opt-in): between begin and launch, conversation_kv_save copies the device K/V device to
+/// device into a VRAM stage (only while 1.5 GB of VRAM stays free beside it; else as before) and records where it
+/// goes; launch moves the stage into the host buffers on a background thread (4 MiB pieces through two pinned
+/// buffers), so the next prompt starts at once.  conversation_park_join (above) waits for it.
+/// begin: false when it is off (the saves then copy as before); `need` is the K/V bytes the saves will copy.
+bool conversation_park_async_begin(size_t need);
+/// The recorded copies start (the device copies into the stage have landed when it returns); false: a copy failed.
+bool conversation_park_async_launch(std::string& error);
+/// Abandons a begun park that was not launched (the error paths): nothing was queued to the background.
+void conversation_park_async_abandon();
+/// STRATA_PARK_VRAM_MIB=N (with STRATA_PARK_ASYNC): a park also keeps the whole K/V of its image in VRAM, in a slot
+/// of its own taken at begin while the slots' total stays within N MiB (and 1.5 GB of VRAM stays free), so a restore
+/// of that image copies device to device from the slot (conversation_kv_restore / _prefix) instead of host to
+/// device, and does not wait for the background copy.  The slot lives as long as the image and its K/V layers
+/// (SavedConversation::pending, ConversationKv::pending).  Default 0: off.
+/// The tag of the begun park's slot (0: none); kept until the next begin, for the tokens.
+uint64_t conversation_park_slot_tag();
+/// Frees the slot under `tag` (no-op for 0 or a slot already gone); the caller joined the copy that reads it.
+void conversation_park_slot_release(uint64_t tag);
+/// VRAM pressure: joins the background copy, then frees every slot and the stage.  Returns the bytes freed (0, and
+/// nothing is touched, while STRATA_PARK_VRAM_MIB is unset).
+size_t conversation_park_vram_release_all();
+/// conversation_park_join, unless every K/V layer of `image` has its slot (the restore then reads no host buffer
+/// the background copy could still be filling; a layer that falls back to the host joins for itself).
+void conversation_park_join_for(const SavedConversation& image);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+// conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
+// sessions carved alike on the same device; the caller synchronizes the device before (as for the restore).
+// `queued`: the copies are only queued (the private copy stream), and the caller synchronizes the device after too.
+bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
+                                  const ModelGeometry& g, std::string& error, bool queued = false);
 // Default-off native diagnostics call these only at a drained ownership boundary.
 // Streaming readback uses bounded64KiB scratch, no second full image.
 bool conversation_snapshot_verify(const SavedConversation&,const SessionState&,const ModelGeometry&,
@@ -94,14 +203,38 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+// The same without the draft layer's K/V (`draft == nullptr`): `sources` holds the session's own QSA layers only,
+// matching a snapshot validated and restored with the nullable-draft calls below.  A layer split's later stages park
+// this way.
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
-enum class ConversationRestore { restored, invalid, transfer_failed };
+/// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
+/// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
+/// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
+bool conversation_copy_stream_ready(int device);
+// (enum class ConversationRestore is declared above, before its first use in ConversationKvRestoreResult.)
+// The disk capsule's two halves.  Validation: the same metadata checks, with the image required to carry NO resident
+// K/V (it lives in the capsule file, and the caller proves those layers against the session's targets before any
+// write).  Restore: the running state and checkpoints, with no K/V call at all - the caller restores the K/V from
+// the capsule first, so the layer-by-layer order stays main K/V, main recurrent state, MTP K/V, MTP resident state.
+bool conversation_snapshot_validate_resident(const SavedConversation& image, const SessionState& session,
+                                             const ModelGeometry& g, std::string& error);
+bool conversation_snapshot_restore_resident(const SavedConversation& image, SessionState& session,
+                                            const ModelGeometry& g, std::string& error);
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    std::string& error);
+// The K/V of the image's first `upto` tokens (main layers and the draft layer), not its running state: the caller
+// mounts a checkpoint taken at `upto`.  For a checkpoint of a parked conversation that a new conversation starts
+// with, while the parked one stays where it is (ConversationCache::borrows).  Same failure contract as above.
+ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+                                                          SessionState& session, const ModelGeometry& g,
+                                                          const QsaState& draft, std::string& error);
 
 // The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.
@@ -112,12 +245,21 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                          size_t& bytes, std::string& error);
+// `storage` (optional, STRATA_CKPT_POOL): dropped checkpoints whose vectors the image's running state and checkpoint
+// copies go into (their pages are in: no fresh pages to fault); the ones not used are left in it.
+// `moved` (optional): checkpoints the caller drops after this, moved into the image after the copies of the view's
+// (the image holds the same checkpoints as with all of them in the view; nothing is copied for these)
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                std::vector<ConversationCheckpoint>* storage = nullptr,
+                                std::vector<ConversationCheckpoint>* moved = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+                                                          SessionState& session, const ModelGeometry& g,
+                                                          const QsaState* draft, std::string& error);
 
 } // namespace strata::core

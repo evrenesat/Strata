@@ -3,7 +3,13 @@
 #include "strata/core/spec_prob.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <optional>
 #include <type_traits>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace strata::program;
 using namespace strata::core;
@@ -106,6 +112,104 @@ void ownership() {
     const auto own=finished-began-(resumed-paused);
     check(own.hits==10 && own.file_bytes==100,"Hermes cumulative work excluded from coding accounting");
 }
+// One small spilled capsule in a private temp directory: the file is anonymous, so removing the directory afterwards
+// leaves nothing behind while the descriptor keeps the bytes alive.
+std::optional<CapsuleSpill> make_spill(const char* name, uint64_t payload) {
+    namespace fs=std::filesystem;
+    const fs::path dir=fs::temp_directory_path()/(std::string(name)+"-"+std::to_string(::getpid()));
+    std::error_code ec; fs::remove_all(dir,ec); fs::create_directory(dir,ec); ::chmod(dir.c_str(),0700);
+    std::string error;
+    SpillDirectory spot=SpillDirectory::open(dir.string(),error);
+    if (!spot.valid()) { fs::remove_all(dir,ec); return std::nullopt; }
+    SpillManifest manifest; manifest.request_id=7;
+    SpillLayer layer; layer.geometry.layer=0; layer.geometry.include_index=true;
+    layer.sizes={payload,0,0,0,0};
+    manifest.main.push_back(layer);
+    SpillWriter writer=SpillWriter::create(spot,manifest,error);
+    if (!writer.valid()) { fs::remove_all(dir,ec); return std::nullopt; }
+    std::vector<uint8_t> buffer(payload,0x5A);
+    const bool wrote=writer.append(buffer.data(),buffer.size(),error) && writer.finish(error);
+    CapsuleSpill spill;
+    if (wrote) { spill.file=writer.release(); spill.manifest=writer.manifest(); }
+    fs::remove_all(dir,ec);
+    if (!wrote) return std::nullopt;
+    return spill;
+}
+
+void spill_ownership() {
+    std::string e;
+    const uint64_t payload=1u<<20;
+    auto spill=make_spill("strata-capsule-spill",payload);
+    if (!spill) {
+        std::printf("generation capsule: spill ownership checks skipped (no supported spill filesystem)\n");
+        return;
+    }
+    check(spill->spilled_bytes()==payload,"a spill reports its logical file bytes");
+    const size_t resident=spill->bytes();
+    check(spill->valid() && resident<payload/8,"a spill retains its manifest, not the payload");
+
+    auto d=driver(); const auto* tokens=d.consumed.data();
+    std::vector<ConversationCheckpoint> cp(1); cp[0].ids={1};
+    SavedConversation main; main.live.ids=d.consumed;    // no host K/V: this capsule's is on disk
+    std::optional<MtpRequestState> no_mtp;
+    GenerationCapsule parked;
+    // A refused publish leaves the caller owning the file and the driver.
+    const auto old=d.consumed;
+    check(!generation_publish(parked,d,cp,std::move(main),std::move(no_mtp),4096,std::nullopt,e,
+                              std::move(spill)),
+          "unknown post-capture RAM refuses a disk capsule too");
+    check(d.consumed==old && d.consumed.data()==tokens && !parked.occupied && !parked.spill,
+          "a refused publish keeps the driver and publishes no spill");
+    check(spill && spill->valid(), "the caller still owns the refused capsule's file");
+
+    auto second=make_spill("strata-capsule-spill-2",payload);
+    check(second.has_value(),"a second capsule file opens");
+    SavedConversation disk_main; disk_main.live.ids=d.consumed;
+    check(generation_publish(parked,d,cp,std::move(disk_main),std::move(no_mtp),4096,capsule_free_floor,e,
+                             std::move(second)),
+          "an admitted disk capsule publishes");
+    check(parked.occupied && parked.spill && parked.spill->valid() && parked.spilled_bytes()==payload,
+          "the published capsule owns its spill and reports its bytes");
+    check(second && !second->file.valid(),"the descriptor moved into the capsule, leaving no second owner");
+
+    // One owner: a move takes the descriptor, an explicit release hands it to a restore, and a take drops it.
+    GenerationCapsule moved=std::move(parked);
+    check(moved.spill && !parked.spill && !parked.occupied,"a capsule move carries the spill as one owner");
+    const int fd=moved.spill->file.fd();
+    auto taken=moved.release_spill();
+    check(taken && taken->valid() && !moved.spill,"release hands the file to the restore");
+    taken.reset();
+    check(::fcntl(fd,F_GETFD)<0,"dropping the taken file closes its descriptor");
+
+    auto third=make_spill("strata-capsule-spill-3",payload);
+    auto live=driver();
+    std::vector<ConversationCheckpoint> cp3(1); cp3[0].ids={1};
+    SavedConversation main3; main3.live.ids=live.consumed;
+    GenerationCapsule capsule;
+    check(generation_publish(capsule,live,cp3,std::move(main3),std::nullopt,4096,capsule_free_floor,e,
+                             std::move(third)),
+          "a second disk capsule publishes");
+    const int live_fd=capsule.spill->file.fd();
+    auto restored=driver(); restored.phase=GenerationPhase::terminal;
+    generation_take(capsule,restored,cp3);
+    check(!capsule.occupied && !capsule.spill && ::fcntl(live_fd,F_GETFD)<0,
+          "taking a spilled capsule closes its file and frees the capsule");
+
+    // Malformed spills refuse the publish instead of publishing half a capsule.
+    auto bad=make_spill("strata-capsule-spill-4",payload);
+    auto d4=driver(); std::vector<ConversationCheckpoint> cp4; SavedConversation m4; m4.live.ids=d4.consumed;
+    bad->file.reset();
+    GenerationCapsule refused;
+    check(!generation_publish(refused,d4,cp4,std::move(m4),std::nullopt,4096,capsule_free_floor,e,std::move(bad)),
+          "a spill without an open file is refused");
+    auto both=make_spill("strata-capsule-spill-5",payload);
+    auto d5=driver(); std::vector<ConversationCheckpoint> cp5; SavedConversation m5; m5.live.ids=d5.consumed;
+    m5.kv.resize(1);
+    check(!generation_publish(refused,d5,cp5,std::move(m5),std::nullopt,4096,capsule_free_floor,e,std::move(both)),
+          "resident K/V and a spill cannot both be published");
+    check(!refused.occupied,"a malformed spill publishes nothing");
+}
+
 void mtp_layout() {
     std::string e; auto s=mtp(); const auto geometry=s.geometry;
     check(s.validate_layout(geometry,73,16,e),"complete MTP manifest with lookahead extent validates");
@@ -126,6 +230,8 @@ int main() {
     static_assert(!std::is_copy_constructible_v<GenerationDriver>);
     static_assert(!std::is_copy_constructible_v<MtpRequestState>);
     static_assert(std::is_nothrow_move_constructible_v<GenerationCapsule>);
-    boundaries(); ownership(); mtp_layout();
+    static_assert(!std::is_copy_constructible_v<CapsuleSpill>);
+    static_assert(std::is_nothrow_move_constructible_v<CapsuleSpill>);
+    boundaries(); ownership(); spill_ownership(); mtp_layout();
     std::printf("generation capsule: %d checks passed\n",checks);
 }

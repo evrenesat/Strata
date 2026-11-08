@@ -34,8 +34,15 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 
 /// experts() for native blobs: b.blob[e - e0] is the native blob of expert e (gate at 0, up at g.up_off, down at
 /// g.down_off; 2-byte aligned).  `xa` from quantize_act_native; H in `ha` (act_bytes(n, 640)); down into `dm` at the
-/// rows of `group`.
+/// rows of `group`.  `dm` 16-byte aligned (gfx12 stores float4; checked there - the prompt path's buffers are 256-aligned
+/// through Alloc's 256-byte takes from a 256-aligned cache slot or cudaMalloc).
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
+                    const int32_t* src, void* ha, float* dm, void* stream);
+/// The NT = 256 kernels (STRATA_PF_FUSED_NT=256 or _F16=1) or the warp-specialized kernel (STRATA_PF_FUSED_WS=1) are
+/// set up on the current device: experts_native takes a WideBatch (STRATA_PF_BATCH up to kBatchRoom experts a launch).
+bool native_wide();
+/// experts_native() of a WideBatch, on the NT = 256 kernels or the warp-specialized kernel; only when native_wide().
+void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream);
 
 }  // namespace strata::prefill::fused

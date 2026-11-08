@@ -2,6 +2,7 @@
 import threading
 import json
 import time
+import urllib.error
 import urllib.request
 import unittest
 from pathlib import Path
@@ -113,6 +114,34 @@ class StreamTests(PipeFixture):
                 self.assertEqual(''.join(c['choices'][0]['delta'].get('content','') for c in data),'wire response')
                 self.assertEqual(sum(c['choices'][0]['finish_reason'] is not None for c in data),1)
                 self.assertEqual(len({c['id'] for c in data}),1)
+        finally:
+            httpd.shutdown();httpd.server_close()
+
+    def test_logprobs_request_refused_and_engine_survives(self):
+        e=self.start(b'wire response')
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).with_name('chat_template.jinja')))
+        httpd=serve(svc,port=0)
+        try:
+            body={'messages':[{'role':'user','content':'hi'}],'max_tokens':128,'logprobs':True,'top_logprobs':5,
+                  'reasoning_effort':'none','priority':'hermes','role':'hermes'}
+            request=urllib.request.Request(f'http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions',
+                data=json.dumps(body).encode(),headers={'Content-Type':'application/json','X-XTX-Client':'hermes-interactive',
+                                                       'X-Priority':'hermes'})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request,timeout=10)
+            self.assertEqual(caught.exception.code,400)
+            error=json.loads(caught.exception.read())
+            self.assertEqual(error['error']['type'],'invalid_request_error')
+            self.assertIn('priority',error['error']['message'])
+            self.assertIsNone(e.proc.poll())                   # the engine process survived the refused request
+            self.assertIsNone(e.priority.dead)                 # the scheduler never saw an untagged line
+            follow={'messages':[{'role':'user','content':'hi'}],'max_tokens':128,'reasoning_effort':'none'}
+            request=urllib.request.Request(f'http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions',
+                data=json.dumps(follow).encode(),headers={'Content-Type':'application/json'})
+            with urllib.request.urlopen(request,timeout=14) as response:
+                self.assertEqual(response.code,200)
+                answer=json.loads(response.read())
+                self.assertEqual(answer['choices'][0]['message']['content'],'wire response')
         finally:
             httpd.shutdown();httpd.server_close()
 

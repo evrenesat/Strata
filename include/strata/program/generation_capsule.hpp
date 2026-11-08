@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/kv_spill.hpp"
 #include "strata/core/mtp_request.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -105,6 +106,27 @@ public:
     GenerationLookupLease(const GenerationLookupLease&) = delete;
 };
 
+// The parked capsule's K/V when it lives on disk instead of in RAM: the anonymous file and the manifest the restore
+// reads it back with.  A spilled capsule retains only the manifest's digests in RAM, so `bytes()` is that retained
+// size and `spilled_bytes()` is the logical file traffic.  One owner; a move moves the descriptor, a reset drops it,
+// and the inode is reclaimed when the last descriptor closes.  `bytes()` intentionally does NOT count the payload:
+// that is the point of spilling it.
+struct CapsuleSpill {
+    core::SpillFile file;
+    core::SpillManifest manifest;
+    CapsuleSpill() = default;
+    CapsuleSpill(const CapsuleSpill&) = delete;
+    CapsuleSpill& operator=(const CapsuleSpill&) = delete;
+    CapsuleSpill(CapsuleSpill&&) noexcept = default;
+    CapsuleSpill& operator=(CapsuleSpill&&) noexcept = default;
+    bool valid() const { return file.valid(); }
+    // RAM this spill keeps alive: the manifest's geometry and one digest per 16 MiB block (a few hundred bytes per
+    // layer at this geometry), never the payload.
+    size_t bytes() const;
+    // Logical bytes the file holds - write traffic and restore input, not device writes.
+    uint64_t spilled_bytes() const { return manifest.payload_bytes; }
+};
+
 struct GenerationCapsule {
     static constexpr uint32_t schema_version = 1;
     uint32_t version = schema_version;
@@ -112,6 +134,9 @@ struct GenerationCapsule {
     GenerationDriver driver;
     core::SavedConversation main; // owns checkpoints by move; no optional LRU owner
     std::optional<core::MtpRequestState> mtp;
+    // Set only when this capsule's K/V was written to disk: `main.kv` then holds no payload and the restore reads the
+    // file.  Empty for the ordinary RAM capsule.
+    std::optional<CapsuleSpill> spill;
     size_t admitted_bytes = 0;
     bool occupied = false;
     GenerationCapsule() = default;
@@ -120,6 +145,9 @@ struct GenerationCapsule {
     GenerationCapsule(GenerationCapsule&& other) noexcept;
     GenerationCapsule& operator=(GenerationCapsule&& other) noexcept;
     size_t bytes() const;
+    uint64_t spilled_bytes() const { return spill ? spill->spilled_bytes() : 0; }
+    // Hand the spill to a restore (or a proof pass): the capsule keeps nothing of it afterwards.
+    std::optional<CapsuleSpill> release_spill();
 };
 
 inline constexpr uint64_t capsule_limit = 4608ull*1024*1024;
@@ -129,9 +157,12 @@ bool generation_memory_admit(std::optional<uint64_t> available, uint64_t allocat
 bool generation_memory_postcheck(std::optional<uint64_t> available, uint64_t retained,
                                  std::string& error);
 // CPU ownership transaction after native readback: all checks precede moves.
+// `spill` publishes the disk capsule atomically with the rest: after every check, and before `occupied` is set.  An
+// invalid or inconsistent spill refuses the whole publish and leaves the caller owning everything.
 bool generation_publish(GenerationCapsule&,GenerationDriver&,
     std::vector<core::ConversationCheckpoint>&,core::SavedConversation&&,
-    std::optional<core::MtpRequestState>&&,size_t,std::optional<uint64_t>,std::string&);
+    std::optional<core::MtpRequestState>&&,size_t,std::optional<uint64_t>,std::string&,
+    std::optional<CapsuleSpill>&& spill = std::nullopt);
 void generation_take(GenerationCapsule&,GenerationDriver&,
                      std::vector<core::ConversationCheckpoint>&) noexcept;
 
